@@ -17,12 +17,13 @@ import subprocess
 
 from aiogram import Bot, types, Router, F
 from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
 
-# Используем тот же Dispatcher и маршруты, что и в webhook.py (если там что-то подключено)
+# Используем тот же Dispatcher, что и в webhook.py (если там что-то подключено)
 from webhook import dp  # noqa: F401
 
 # ---------- Мини HTTP-сервер для Render (нужен только если это Web Service с $PORT) ----------
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 import uvicorn
 
 _health_app = FastAPI()
@@ -30,6 +31,11 @@ _health_app = FastAPI()
 @_health_app.get("/")
 def root():
     return {"status": "ok", "service": "polling-worker"}
+
+@_health_app.head("/")
+def head_root():
+    # Render часто шлёт HEAD /
+    return Response(status_code=200)
 
 @_health_app.get("/healthz")
 def healthz():
@@ -91,7 +97,8 @@ async def run_polling() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-    bot = Bot(token=token, parse_mode="HTML")
+    # aiogram >= 3.7: parse_mode задаём через DefaultBotProperties
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
 
     # ВАЖНО: удаляем вебхук, иначе Telegram не будет слать сообщения в long polling
     drop = os.getenv("DROP_UPDATES_ON_START", "true").lower() in ("1", "true", "yes", "y")
@@ -109,7 +116,7 @@ async def run_polling() -> None:
         logging.warning("[POLL] include_router(basic_router) failed: %s", e)
 
     logging.info("[POLL] Starting dp.start_polling() ...")
-    # ВАЖНО: не передаём allowed_updates — пусть приходят все типы
+    # Не ограничиваем allowed_updates — пусть приходят все типы
     from webhook import dp as _dp
     await _dp.start_polling(bot)
 
