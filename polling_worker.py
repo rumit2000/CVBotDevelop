@@ -61,5 +61,3 @@ if __name__ == "__main__":
     )
     _run_ingestion_if_needed()
     asyncio.run(main())
-PY
-
