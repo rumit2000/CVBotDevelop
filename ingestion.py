@@ -68,31 +68,51 @@ if api_key:
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
+
         system = (
             "Ты пишешь JSON-объект с часто задаваемыми вопросами по резюме. "
-            "Строго верни JSON-объект формата: {\"topics\":[{\"q\":\"...\",\"a\":\"...\"}]} без пояснений."
+            'Строго верни JSON-объект формата {"topics":[{"q":"...","a":"..."}]} без пояснений.'
         )
         user = (
             "Сгенерируй 5 лаконичных Q&A на русском по резюме ниже. "
             "Короткие вопросы и короткие ответы (1–3 предложения). Текст резюме:\n\n"
             + (snippet or about_text)
         )
-        resp = client.responses.create(
+
+        # Используем Chat Completions (надёжнее в разных версиях SDK)
+        chat = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL_JSON", "gpt-4o-mini"),
-            input=[{"role": "system", "content": system},
-                   {"role": "user", "content": user}],
-            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
             temperature=0.2,
         )
-        raw = resp.output_text
-        parsed = json.loads(raw) if raw else {}
+        raw = (chat.choices[0].message.content or "").strip()
+
+        # Пытаемся аккуратно извлечь JSON даже если модель вернула с ```json
+        candidate = raw
+        if "```" in raw:
+            parts = raw.split("```")
+            # ищем блок с json
+            for i in range(len(parts) - 1):
+                block = parts[i + 1]
+                if block.strip().startswith("json"):
+                    candidate = block.split("\n", 1)[1] if "\n" in block else ""
+                    break
+
+        parsed = json.loads(candidate) if candidate else {}
         if isinstance(parsed, list):
             parsed = {"topics": parsed}
         topics = parsed.get("topics", []) if isinstance(parsed, dict) else []
         if isinstance(topics, list):
             faq_payload = {"topics": topics}
+        else:
+            print("[INGEST] model returned non-list topics, keeping empty list")
     except Exception as e:
         print(f"[INGEST] JSON parse error from model: {e}")
+else:
+    print("[INGEST] OPENAI_API_KEY not set; skipping FAQ generation")
 
 try:
     serialized = json.dumps(faq_payload, ensure_ascii=False, indent=2)

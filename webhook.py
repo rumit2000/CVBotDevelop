@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import List, Any
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 # Пытаемся использовать готовые bot/dp из вашего bot.py (aiogram v3)
@@ -71,10 +71,18 @@ async def root():
         "faq_topics_count": len(FAQ_TOPICS),
     }
 
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
+
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+@app.head("/healthz")
+async def healthz_head():
+    return Response(status_code=200)
 
 
 @app.get("/cache")
