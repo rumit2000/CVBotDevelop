@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
+"""
+Polling worker for Telegram.
+
+- Токен берём из переменной окружения TELEGRAM_BOT_TOKEN.
+- Перед стартом удаляем вебхук (чтобы не конфликтовал с polling).
+- Если задан $PORT (Render Web Service) — поднимаем / и /healthz, чтобы Render видел открытый порт.
+- Однократно гоняем ingestion, если кешей ещё нет.
+- Подключаем базовые хэндлеры: /start и ответ на любой текст (для диагностики).
+"""
+
 import os
 import sys
 import asyncio
 import logging
 import subprocess
 
-from aiogram import Bot
+from aiogram import Bot, types, Router, F
+from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
-from webhook import dp  # используем те же роутеры/хэндлеры
 
-# --- опциональный HTTP для Render (если это Web Service) ---
-from fastapi import FastAPI
+# Используем тот же Dispatcher, что и в webhook.py (если там что-то подключено)
+from webhook import dp  # noqa: F401
+
+# ---------- Мини HTTP-сервер для Render (нужен только если это Web Service с $PORT) ----------
+from fastapi import FastAPI, Response
 import uvicorn
 
 _health_app = FastAPI()
@@ -19,27 +32,31 @@ _health_app = FastAPI()
 def root():
     return {"status": "ok", "service": "polling-worker"}
 
+@_health_app.head("/")
+def head_root():
+    # Render часто шлёт HEAD /
+    return Response(status_code=200)
+
 @_health_app.get("/healthz")
 def healthz():
     return {"ok": True}
 
-
-async def run_health_server_if_needed():
+async def run_health_server_if_needed() -> None:
     """
-    Если сервис запущен как Web Service и Render ждёт открытый порт,
-    поднимем небольшой HTTP-сервер на $PORT.
+    Если $PORT задан (Render Web Service) — поднимем маленький HTTP-сервер,
+    чтобы Render видел открытый порт и не перезапускал процесс.
     Если $PORT нет (Background Worker) — ничего не делаем.
     """
     port = os.getenv("PORT")
     if not port:
         logging.info("[POLL] No $PORT -> health server is not started (worker mode).")
-        return  # ничего не поднимаем в worker-режиме
+        return
     port = int(port)
     logging.info(f"[POLL] Starting health server on :{port}")
     config = uvicorn.Config(_health_app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
 
 
 def _run_ingestion_if_needed() -> None:
@@ -58,84 +75,32 @@ def _run_ingestion_if_needed() -> None:
         logging.warning("[POLL] ingestion failed: %s", e)
 
 
-async def run_polling():
+# ----------------- БАЗОВЫЕ ХЭНДЛЕРЫ (диагностические, чтобы бот точно отвечал) ----------------
+basic_router = Router()
+
+@basic_router.message(CommandStart())
+async def on_start(message: types.Message):
+    await message.answer(
+        "Привет! Я на связи 👋\n"
+        "Напиши мне любой вопрос — отвечу. Если это тест, просто пришли текст."
+    )
+
+@basic_router.message(F.text)
+async def on_any_text(message: types.Message):
+    # Простой ответ-эхо, чтобы сразу увидеть, что обработчик работает
+    await message.answer(f"Принял: «{message.text}». Сейчас всё работает ✅")
+# ------------------------------------------------------------------------------------------------
+
+
+async def run_polling() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
+    # aiogram >= 3.7: parse_mode задаём через DefaultBotProperties
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
 
-    # Если где-то был выставлен вебхук, удалим его, иначе polling не получит апВот обновлённый файл `polling_worker.py` с исправлением для новой версии aiogram:
-
-```python
-#!/usr/bin/env python3
-import os
-import sys
-import asyncio
-import logging
-import subprocess
-
-from aiogram import Bot
-from aiogram.client.default import DefaultBotProperties
-from webhook import dp  # используем те же роутеры/хэндлеры
-
-# --- опциональный HTTP для Render (если это Web Service) ---
-from fastapi import FastAPI
-import uvicorn
-
-_health_app = FastAPI()
-
-@_health_app.get("/")
-def root():
-    return {"status": "ok", "service": "polling-worker"}
-
-@_health_app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-
-async def run_health_server_if_needed():
-    """
-    Если сервис запущен как Web Service и Render ждёт открытый порт,
-    поднимем небольшой HTTP-сервер на $PORT.
-    Если $PORT нет (Background Worker) — ничего не делаем.
-    """
-    port = os.getenv("PORT")
-    if not port:
-        logging.info("[POLL] No $PORT -> health server is not started (worker mode).")
-        return  # ничего не поднимаем в worker-режиме
-    port = int(port)
-    logging.info(f"[POLL] Starting health server on :{port}")
-    config = uvicorn.Config(_health_app, host="0.0.0.0", port=port, log_level="info")
-    server = uvicorn.Server(config)
-    await server.serve()
-# ------------------------------------------------------------
-
-
-def _run_ingestion_if_needed() -> None:
-    """
-    Прогоним ingestion один раз, если кешей ещё нет.
-    """
-    about_ok = os.path.exists("data/about_cache.txt")
-    faq_ok = os.path.exists("data/faq_cache.json")
-    if about_ok and faq_ok:
-        logging.info("[POLL] Cache detected. Skipping ingestion.")
-        return
-    logging.info("[POLL] No cache detected. Running ingestion...")
-    try:
-        subprocess.run([sys.executable, "ingestion.py"], check=False)
-    except Exception as e:
-        logging.warning("[POLL] ingestion failed: %s", e)
-
-
-async def run_polling():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-
-    # Если где-то был выставлен вебхук, удалим его, иначе polling не получит апдейты
+    # ВАЖНО: удаляем вебхук, иначе Telegram не будет слать сообщения в long polling
     drop = os.getenv("DROP_UPDATES_ON_START", "true").lower() in ("1", "true", "yes", "y")
     try:
         await bot.delete_webhook(drop_pending_updates=drop)
@@ -143,27 +108,31 @@ async def run_polling():
     except Exception as e:
         logging.warning("[POLL] delete_webhook failed: %s", e)
 
+    # Подключаем базовые хэндлеры (и любые другие, которые уже подключены в webhook.py к dp)
+    try:
+        from webhook import dp as _dp  # тот же объект, что импортирован выше
+        _dp.include_router(basic_router)
+    except Exception as e:
+        logging.warning("[POLL] include_router(basic_router) failed: %s", e)
+
     logging.info("[POLL] Starting dp.start_polling() ...")
-    await dp.start_polling(
-        bot,
-        allowed_updates=dp.resolve_used_update_types(),
-    )
+    # Не ограничиваем allowed_updates — пусть приходят все типы
+    from webhook import dp as _dp
+    await _dp.start_polling(bot)
 
 
-async def main():
-    # Поднимем health-сервер (если требуется порт) параллельно с polling
+async def main() -> None:
+    # Параллельно поднимем health-сервер (если нужен) и запустим polling
     health_task = asyncio.create_task(run_health_server_if_needed())
     polling_task = asyncio.create_task(run_polling())
 
-    # ждём завершения любой из задач
     done, pending = await asyncio.wait(
-        {health_task, polling_task}, return_when=asyncio.FIRST_EXCEPTION
+        {health_task, polling_task},
+        return_when=asyncio.FIRST_EXCEPTION,
     )
 
-    # если одна из задач упала — отменим вторую
     for t in pending:
         t.cancel()
-    # пробросим исключение, если было
     for t in done:
         exc = t.exception()
         if exc:
