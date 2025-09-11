@@ -63,7 +63,3 @@ if __name__ == "__main__":
     asyncio.run(main())
 PY
 
-chmod +x polling_worker.py
-git add polling_worker.py
-git commit -m "Fix: proper long-polling worker (no shell inside Python)"
-git push
