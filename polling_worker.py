@@ -1,3 +1,4 @@
+# в корне проекта
 cat > polling_worker.py <<'PY'
 #!/usr/bin/env python3
 import os
@@ -8,13 +9,16 @@ import subprocess
 
 from aiogram import Bot
 
-# Берём тот же Dispatcher с хэндлерами, что использует веб-сервис.
-# В твоём проекте он определяется в webhook.py и называется dp.
+# Берём тот же Dispatcher и хэндлеры, что используются веб-сервисом.
+# В твоём проекте dp объявлен в webhook.py.
 from webhook import dp
 
 
 def _run_ingestion_if_needed() -> None:
-    """Прогоняем ingestion один раз, если кешей нет (чтобы воркер работал автономно)."""
+    """
+    Прогоним ingestion один раз, если кешей ещё нет — чтобы воркер
+    работал автономно и не зависел от порядка старта сервисов.
+    """
     about_ok = os.path.exists("data/about_cache.txt")
     faq_ok = os.path.exists("data/faq_cache.json")
     if about_ok and faq_ok:
@@ -34,7 +38,7 @@ async def main() -> None:
 
     bot = Bot(token=token)
 
-    # Если раньше был вебхук — удалим, иначе polling не получит апдейты.
+    # Если где-то был выставлен вебхук, удалим его, иначе polling не получит апдейты
     drop = os.getenv("DROP_UPDATES_ON_START", "true").lower() in ("1", "true", "yes", "y")
     try:
         await bot.delete_webhook(drop_pending_updates=drop)
@@ -58,4 +62,8 @@ if __name__ == "__main__":
     _run_ingestion_if_needed()
     asyncio.run(main())
 PY
+
 chmod +x polling_worker.py
+git add polling_worker.py
+git commit -m "Fix: proper long-polling worker (no shell inside Python)"
+git push
