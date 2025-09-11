@@ -1,0 +1,52 @@
++ set -xeuo pipefail
++ export PYTHONUNBUFFERED=1
++ PYTHONUNBUFFERED=1
+++ python3 -V
++ echo '[BOOT] Python:' Python 3.12.11
+[BOOT] Python: Python 3.12.11
++ python3 -c 'import sys; print('\''[BOOT] Executable:'\'', sys.executable)'
+[BOOT] Executable: /Users/timurasyaev/CVBot/.venv/bin/python3
++ python3 -c 'import uvicorn; print('\''[BOOT] uvicorn:'\'', uvicorn.__version__)'
+[BOOT] uvicorn: 0.35.0
++ '[' '!' -f data/about_cache.txt ']'
++ '[' '!' -f data/faq_cache.json ']'
++ echo '[BOOT] Cache found: data/about_cache.txt & data/faq_cache.json'
+[BOOT] Cache found: data/about_cache.txt & data/faq_cache.json
++ echo '[BOOT] Starting uvicorn on port 8000 ...'
+[BOOT] Starting uvicorn on port 8000 ...
++ exec python3 -m uvicorn webhook:app --host 0.0.0.0 --port 8000 --log-level info --access-log
+INFO:     Started server process [55105]
+INFO:     Waiting for application startup.
+[CACHE] Loaded: about=OK, faq_topics=7
+ERROR:    Traceback (most recent call last):
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/starlette/routing.py", line 694, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/starlette/routing.py", line 571, in __aenter__
+    await self._router.startup()
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/starlette/routing.py", line 671, in startup
+    await handler()
+  File "/Users/timurasyaev/CVBot/webhook.py", line 461, in on_startup
+    await bot.set_webhook(url, secret_token=settings.webhook_secret)
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/aiogram/client/bot.py", line 3820, in set_webhook
+    return await self(call, request_timeout=request_timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/aiogram/client/bot.py", line 485, in __call__
+    return await self.session(self, method, timeout=request_timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/aiogram/client/session/base.py", line 254, in __call__
+    return cast(TelegramType, await middleware(bot, method))
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/aiogram/client/session/aiohttp.py", line 185, in make_request
+    response = self.check_response(
+               ^^^^^^^^^^^^^^^^^^^^
+  File "/Users/timurasyaev/CVBot/.venv/lib/python3.12/site-packages/aiogram/client/session/base.py", line 120, in check_response
+    raise TelegramBadRequest(method=method, message=description)
+aiogram.exceptions.TelegramBadRequest: Telegram server says - Bad Request: secret token contains unallowed characters
+
+ERROR:    Application startup failed. Exiting.
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x108cfd2b0>
+Unclosed connector
+connections: ['deque([(<aiohttp.client_proto.ResponseHandler object at 0x108cbfad0>, 358378.646755875)])']
+connector: <aiohttp.connector.TCPConnector object at 0x108cfce30>
