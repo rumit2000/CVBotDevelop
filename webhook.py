@@ -1,4 +1,4 @@
-
+# webhook.py
 import os
 import json
 from pathlib import Path
@@ -7,11 +7,10 @@ from typing import List, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-
+# Пытаемся использовать готовые bot/dp из вашего bot.py (aiogram v3)
 try:
-    from bot import bot, dp  
+    from bot import bot, dp  # type: ignore
 except Exception:
-
     from aiogram import Bot, Dispatcher
     _token = (os.getenv("TELEGRAM_BOT_TOKEN") or "000:FAKE").strip()
     bot = Bot(_token)
@@ -29,7 +28,7 @@ def load_cache() -> None:
     """Загружаем кэш; терпимо относимся к пустым/старым форматам."""
     global ABOUT_CACHE, FAQ_TOPICS
 
- 
+    # about
     ABOUT_CACHE = ""
     about_path = Path("data/about_cache.txt")
     if about_path.exists():
@@ -38,7 +37,7 @@ def load_cache() -> None:
         except Exception as e:
             print(f"[CACHE] about read error: {e}")
 
-
+    # faq
     FAQ_TOPICS = []
     faq_path = Path("data/faq_cache.json")
     payload: Any = {}
@@ -51,6 +50,7 @@ def load_cache() -> None:
             print(f"[CACHE] faq json decode error: {e}")
             payload = {}
 
+    # миграция: если это список, оборачиваем в {"topics":[...]}
     if isinstance(payload, list):
         payload = {"topics": payload}
 
@@ -64,7 +64,6 @@ def load_cache() -> None:
 
 @app.get("/")
 async def root():
-
     return {
         "ok": True,
         "service": "cvbot",
@@ -125,7 +124,7 @@ async def telegram_webhook(secret: str, request: Request):
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     try:
-        update = Update.model_validate(data)  
+        update = Update.model_validate(data)  # aiogram v3 + pydantic v2
     except Exception as e:
         print(f"[WEBHOOK] bad update: {e}")
         return JSONResponse({"ok": False, "error": "bad update"}, status_code=400)

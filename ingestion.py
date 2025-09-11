@@ -58,7 +58,7 @@ about_text = snippet or default_about
 try:
     about_path.write_text(about_text, encoding="utf-8")
     print(f"[INGEST] wrote: {about_path} ({len(about_text)} bytes)")
-} except Exception as e:
+except Exception as e:
     print(f"[INGEST] about write error: {e}")
 
 faq_payload = {"topics": []}
@@ -70,8 +70,7 @@ if api_key:
         client = OpenAI(api_key=api_key)
         system = (
             "Ты пишешь JSON-объект с часто задаваемыми вопросами по резюме. "
-            "Строго верни JSON-объект формата: {\"topics\":[{\"q\":\"...\"," 
-            "\"a\":\"...\"}]} без пояснений."
+            "Строго верни JSON-объект формата: {\"topics\":[{\"q\":\"...\",\"a\":\"...\"}]} без пояснений."
         )
         user = (
             "Сгенерируй 5 лаконичных Q&A на русском по резюме ниже. "
