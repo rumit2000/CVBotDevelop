@@ -58,9 +58,9 @@ def _run_ingestion_if_needed() -> None:
 
 
 async def run_polling():
-    token = os.environ.get("TELEGRAM_TOKEN")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_TOKEN is not set")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
     bot = Bot(token=token)
 
