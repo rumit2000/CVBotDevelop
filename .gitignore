@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+data/about_cache.txt
+data/faq_cache.json
