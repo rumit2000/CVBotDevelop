@@ -1,149 +1,116 @@
-#!/usr/bin/env python3
-"""
-Polling worker for Telegram.
-
-- Токен берём из переменной окружения TELEGRAM_BOT_TOKEN.
-- Перед стартом удаляем вебхук (чтобы не конфликтовал с polling).
-- Если задан $PORT (Render Web Service) — поднимаем / и /healthz, чтобы Render видел открытый порт.
-- Однократно гоняем ingestion, если кешей ещё нет.
-- Подключаем базовые хэндлеры: /start и ответ на любой текст (для диагностики).
-"""
+# polling_worker.py
+# Фоновый воркер для Render: запускает health-сервер на $PORT и лонг-поллинг Telegram.
+# Без вебхука. Подключает "боевые" хэндлеры из bot.py.
 
 import os
 import sys
 import asyncio
 import logging
 import subprocess
+from pathlib import Path
 
-from aiogram import Bot, types, Router, F
-from aiogram.filters import CommandStart
-from aiogram.client.default import DefaultBotProperties
-
-# Используем тот же Dispatcher, что и в webhook.py (если там что-то подключено)
-from webhook import dp  # noqa: F401
-
-# ---------- Мини HTTP-сервер для Render (нужен только если это Web Service с $PORT) ----------
-from fastapi import FastAPI, Response
+from fastapi import FastAPI
 import uvicorn
 
-_health_app = FastAPI()
+from aiogram import Dispatcher, Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramConflictError
 
-@_health_app.get("/")
-def root():
-    return {"status": "ok", "service": "polling-worker"}
+from bot import register_handlers  # наши хэндлеры
 
-@_health_app.head("/")
-def head_root():
-    # Render часто шлёт HEAD /
-    return Response(status_code=200)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("polling")
 
-@_health_app.get("/healthz")
-def healthz():
-    return {"ok": True}
+DATA_DIR = Path("data")
+ABOUT_FILE = DATA_DIR / "about_cache.txt"
+FAQ_FILE = DATA_DIR / "faq_cache.json"
 
-async def run_health_server_if_needed() -> None:
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+if not TELEGRAM_BOT_TOKEN:
+    print("[POLL] ERROR: TELEGRAM_BOT_TOKEN не задан")
+    sys.exit(1)
+
+def run_ingestion_if_needed() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not ABOUT_FILE.exists():
+        log.info("[POLL] No cache detected. Running ingestion...")
+        try:
+            ret = subprocess.run([sys.executable, "ingestion.py"], check=False)
+            if ret.returncode != 0:
+                log.warning("[POLL] ingestion.py exited with non-zero code, continue anyway")
+        except Exception as e:
+            log.warning(f"[POLL] ingestion failed: {e}")
+
+# ---- Health сервер (чтобы Render видел открытый порт) ---------------
+
+def start_health_server() -> asyncio.Task:
     """
-    Если $PORT задан (Render Web Service) — поднимем маленький HTTP-сервер,
-    чтобы Render видел открытый порт и не перезапускал процесс.
-    Если $PORT нет (Background Worker) — ничего не делаем.
+    Поднимаем FastAPI на $PORT (или 10000). Возвращаем task.
     """
-    port = os.getenv("PORT")
-    if not port:
-        logging.info("[POLL] No $PORT -> health server is not started (worker mode).")
-        return
-    port = int(port)
-    logging.info(f"[POLL] Starting health server on :{port}")
-    config = uvicorn.Config(_health_app, host="0.0.0.0", port=port, log_level="info")
+    app = FastAPI()
+
+    @app.get("/")
+    def root():
+        return {"ok": True, "service": "polling-worker"}
+
+    port = int(os.getenv("PORT", "10000"))
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
-    await server.serve()
-# ---------------------------------------------------------------------------------------------
+    log.info(f"[POLL] Starting health server on :{port}")
+    return asyncio.create_task(server.serve())
 
-
-def _run_ingestion_if_needed() -> None:
-    """
-    Прогоним ingestion один раз, если кешей ещё нет.
-    """
-    about_ok = os.path.exists("data/about_cache.txt")
-    faq_ok = os.path.exists("data/faq_cache.json")
-    if about_ok and faq_ok:
-        logging.info("[POLL] Cache detected. Skipping ingestion.")
-        return
-    logging.info("[POLL] No cache detected. Running ingestion...")
-    try:
-        subprocess.run([sys.executable, "ingestion.py"], check=False)
-    except Exception as e:
-        logging.warning("[POLL] ingestion failed: %s", e)
-
-
-# ----------------- БАЗОВЫЕ ХЭНДЛЕРЫ (диагностические, чтобы бот точно отвечал) ----------------
-basic_router = Router()
-
-@basic_router.message(CommandStart())
-async def on_start(message: types.Message):
-    await message.answer(
-        "Привет! Я на связи 👋\n"
-        "Напиши мне любой вопрос — отвечу. Если это тест, просто пришли текст."
-    )
-
-@basic_router.message(F.text)
-async def on_any_text(message: types.Message):
-    # Простой ответ-эхо, чтобы сразу увидеть, что обработчик работает
-    await message.answer(f"Принял: «{message.text}». Сейчас всё работает ✅")
-# ------------------------------------------------------------------------------------------------
-
+# ---- Поллинг --------------------------------------------------------
 
 async def run_polling() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    # Инициализируем бота правильно для aiogram>=3.7 (parse_mode через DefaultBotProperties)
+    bot = Bot(
+        token=TELEGRAM_BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+    register_handlers(dp)
 
-    # aiogram >= 3.7: parse_mode задаём через DefaultBotProperties
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-
-    # ВАЖНО: удаляем вебхук, иначе Telegram не будет слать сообщения в long polling
-    drop = os.getenv("DROP_UPDATES_ON_START", "true").lower() in ("1", "true", "yes", "y")
+    # На всякий случай очищаем вебхук и дропаем накопившиеся апдейты
     try:
-        await bot.delete_webhook(drop_pending_updates=drop)
-        logging.info("[POLL] delete_webhook ok (drop=%s)", drop)
+        await bot.delete_webhook(drop_pending_updates=True)
+        log.info("[POLL] delete_webhook ok (drop=True)")
     except Exception as e:
-        logging.warning("[POLL] delete_webhook failed: %s", e)
+        log.warning(f"[POLL] delete_webhook failed: {e}")
 
-    # Подключаем базовые хэндлеры (и любые другие, которые уже подключены в webhook.py к dp)
-    try:
-        from webhook import dp as _dp  # тот же объект, что импортирован выше
-        _dp.include_router(basic_router)
-    except Exception as e:
-        logging.warning("[POLL] include_router(basic_router) failed: %s", e)
-
-    logging.info("[POLL] Starting dp.start_polling() ...")
-    # Не ограничиваем allowed_updates — пусть приходят все типы
-    from webhook import dp as _dp
-    await _dp.start_polling(bot)
-
+    # Стартуем поллинг с бэкоффом на конфликт (если где-то есть второй поллер)
+    backoff = 1.0
+    tries = 0
+    while True:
+        try:
+            log.info("[POLL] Starting dp.start_polling() ...")
+            await dp.start_polling(bot)
+            break  # штатная остановка
+        except TelegramConflictError as e:
+            log.error(f"Failed to fetch updates - {e.__class__.__name__}: {e}")
+            log.warning(f"Sleep for {backoff:.6f} seconds and try again... (tryings = {tries}, bot id = {bot.id})")
+            await asyncio.sleep(backoff)
+            tries += 1
+            backoff = min(backoff * 1.3, 5.0)
+            continue
 
 async def main() -> None:
-    # Параллельно поднимем health-сервер (если нужен) и запустим polling
-    health_task = asyncio.create_task(run_health_server_if_needed())
-    polling_task = asyncio.create_task(run_polling())
-
-    done, pending = await asyncio.wait(
-        {health_task, polling_task},
-        return_when=asyncio.FIRST_EXCEPTION,
-    )
-
-    for t in pending:
-        t.cancel()
-    for t in done:
-        exc = t.exception()
-        if exc:
-            raise exc
-
+    run_ingestion_if_needed()
+    health_task = start_health_server()
+    try:
+        await run_polling()
+    finally:
+        try:
+            health_task.cancel()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stdout,
-    )
-    _run_ingestion_if_needed()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user")
