@@ -1,5 +1,3 @@
-# в корне проекта
-cat > polling_worker.py <<'PY'
 #!/usr/bin/env python3
 import os
 import sys
