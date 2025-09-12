@@ -10,7 +10,7 @@ import asyncio
 import os
 import json
 import re
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -146,6 +146,38 @@ def save_faq_cache(topics: List[Dict[str, str]]):
     with open("data/faq_cache.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
+# ========= Нормализация результата RAG =========
+def _norm_ctx(ctx: Any, limit: int = 5) -> List[str]:
+    """
+    Принимает что угодно (строки/списки/кортежи/словари) и возвращает
+    список строк-фрагментов. Безопасно к любым форматам rag.retrieve().
+    """
+    out: List[str] = []
+    if ctx is None:
+        return out
+
+    for item in ctx:
+        text = None
+        if isinstance(item, str):
+            text = item
+        elif isinstance(item, (list, tuple)) and len(item) >= 1:
+            # чаще всего (text, score, ...). Берём первый элемент
+            if isinstance(item[0], str):
+                text = item[0]
+        elif isinstance(item, dict):
+            for k in ("text", "chunk", "content", "fragment"):
+                v = item.get(k)
+                if isinstance(v, str) and v.strip():
+                    text = v
+                    break
+        if text:
+            t = text.strip()
+            if t and t not in out:
+                out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
 # ========= Генерация ответов FAQ из локального RAG =========
 async def _answer_from_resume(full_question: str) -> Optional[str]:
     """
@@ -157,15 +189,16 @@ async def _answer_from_resume(full_question: str) -> Optional[str]:
     except Exception:
         return None
 
-    # ВАЖНО: у rag.retrieve только один аргумент — запрос
-    ctx = rag_retrieve(full_question)
-    if not ctx:
+    try:
+        ctx_raw = rag_retrieve(full_question)  # у rag.retrieve один аргумент
+    except Exception:
         return None
 
-    # Контекст блок
-    context_block = "\n\n".join(
-        [f"Фрагмент #{i+1}:\n{frag}" for i, (frag, _) in enumerate(ctx)]
-    )
+    frags = _norm_ctx(ctx_raw, limit=5)
+    if not frags:
+        return None
+
+    context_block = "\n\n".join([f"Фрагмент #{i+1}:\n{frag}" for i, frag in enumerate(frags)])
 
     system = (
         "Ты помощник по резюме. Отвечай ТОЛЬКО на основе предоставленных фрагментов.\n"
@@ -210,10 +243,8 @@ async def ensure_faq_ready():
 
     if built:
         save_faq_cache(built)
-        # перезагрузим кэш из файла (заодно пройдём фильтры)
         load_cache()
     else:
-        # пусть FAQ останется пустым — кнопки тем не будет, но верхняя FAQ-кнопка остаётся
         ACTIVE_FAQ_TOPICS, FAQ_CACHE = [], {}
 
 # ========= Кнопочные клавиатуры =========
@@ -221,9 +252,7 @@ def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Обо мне", callback_data="about")
     kb.button(text="Скачать резюме", callback_data="resume")
-
-    # FAQ-кнопка теперь ВСЕГДА есть
-    kb.button(text="FAQ от HR", callback_data="faq_menu")
+    kb.button(text="FAQ от HR", callback_data="faq_menu")  # всегда видна
 
     link = (settings.linkedin_url or "").strip()
     if link:
@@ -240,7 +269,6 @@ def faq_kb(page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
     topics = ACTIVE_FAQ_TOPICS
     total = len(topics)
     if total == 0:
-        # Пустой — вернём заглушку «Закрыть»
         kb = InlineKeyboardBuilder()
         kb.button(text="Закрыть", callback_data="faq_close")
         kb.adjust(1)
@@ -306,10 +334,12 @@ async def extract_current_company_from_local_index() -> Optional[str]:
         from rag import retrieve as _retrieve
     except Exception:
         return None
-    ctx = _retrieve("Текущее место работы: укажи название компании и должность (если есть).")
-    if not ctx:
+    ctx_raw = _retrieve("Текущее место работы: укажи название компании и должность (если есть).")
+    frags = _norm_ctx(ctx_raw, limit=3)
+    if not frags:
         return None
-    context_block = "\n\n".join([f"Фрагмент #{i+1}:\n{frag}" for i, (frag, _) in enumerate(ctx)])
+
+    context_block = "\n\n".join([f"Фрагмент #{i+1}:\n{frag}" for i, frag in enumerate(frags)])
     system = (
         "Ты — экстрактор фактов из резюме. Верни строго JSON: "
         '{"company": "..."} без пояснений. Если не уверен — используй null.'
@@ -445,7 +475,7 @@ async def answer_via_assistant(question: str) -> Optional[str]:
     except Exception:
         return None
 
-# ========= Обработчики сообщений =========
+# ========= Callback-хендлеры и команды =========
 async def handle_start(message: types.Message):
     if ABOUT_TEXT:
         intro = "Вы общаетесь с цифровым аватаром резюме Тимура Асяева.\n\n"
@@ -491,7 +521,6 @@ async def handle_reindex(message: types.Message):
         import ingestion
         await asyncio.get_running_loop().run_in_executor(None, ingestion.main)
         load_cache()
-        # после переиндексации пересоберём FAQ
         await ensure_faq_ready()
         await message.answer("Переиндексация и кэш обновлены ✅", reply_markup=main_kb())
     except Exception as e:
@@ -556,7 +585,6 @@ async def cb_linkedin(callback: CallbackQuery):
         await callback.answer()
 
 async def cb_faq_menu(callback: CallbackQuery):
-    # если по какой-то причине кэш пуст — попробуем собрать прямо сейчас
     if not ACTIVE_FAQ_TOPICS:
         await ensure_faq_ready()
     if not ACTIVE_FAQ_TOPICS:
@@ -612,7 +640,6 @@ def contextlib_sup():
 # ========= Startup & registration =========
 async def on_startup():
     load_cache()
-    # Соберём FAQ, если он пуст (или файл отсутствует)
     await ensure_faq_ready()
     print("[STARTUP] Cache loaded; FAQ ready.")
 
