@@ -157,8 +157,8 @@ async def _answer_from_resume(full_question: str) -> Optional[str]:
     except Exception:
         return None
 
-    # ВАЖНО: у rag.retrieve нет именованного параметра 'k' → используем позиционный
-    ctx = rag_retrieve(full_question, 4)
+    # ВАЖНО: у rag.retrieve только один аргумент — запрос
+    ctx = rag_retrieve(full_question)
     if not ctx:
         return None
 
