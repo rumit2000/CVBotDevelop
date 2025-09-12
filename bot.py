@@ -4,7 +4,7 @@
 # - FAQ: свой каталог тем, на старте ответы буферизуются из резюме (через локальный RAG)
 #   темы без ответа скрываются
 # - свободные вопросы: Assistants API (File Search) + tools web_search/web_fetch
-# - если ассистент не справился — общий веб-fолбэк или контакты
+# - если ассистент не справился — общий веб-фолбэк или контакты
 
 import asyncio
 import os
@@ -157,7 +157,8 @@ async def _answer_from_resume(full_question: str) -> Optional[str]:
     except Exception:
         return None
 
-    ctx = rag_retrieve(full_question, k=4)
+    # ВАЖНО: у rag.retrieve нет именованного параметра 'k' → используем позиционный
+    ctx = rag_retrieve(full_question, 4)
     if not ctx:
         return None
 
