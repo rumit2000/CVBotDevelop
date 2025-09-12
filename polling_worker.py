@@ -1,6 +1,6 @@
 # polling_worker.py
-# Фоновый воркер для Render: запускает health-сервер на $PORT и лонг-поллинг Telegram.
-# Без вебхука. Подключает "боевые" хэндлеры из bot.py.
+# Воркер для Render: health-сервер на $PORT + лонг-поллинг Telegram (без вебхука).
+# Подключает боевые хэндлеры из bot.py. Токен берётся из TELEGRAM_BOT_TOKEN.
 
 import os
 import sys
@@ -17,17 +17,16 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramConflictError
 
-from bot import register_handlers  # наши хэндлеры
+from bot import register_handlers
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("polling")
+log = logging.getLogger("[POLL]")
 
 DATA_DIR = Path("data")
 ABOUT_FILE = DATA_DIR / "about_cache.txt"
-FAQ_FILE = DATA_DIR / "faq_cache.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not TELEGRAM_BOT_TOKEN:
@@ -45,12 +44,7 @@ def run_ingestion_if_needed() -> None:
         except Exception as e:
             log.warning(f"[POLL] ingestion failed: {e}")
 
-# ---- Health сервер (чтобы Render видел открытый порт) ---------------
-
 def start_health_server() -> asyncio.Task:
-    """
-    Поднимаем FastAPI на $PORT (или 10000). Возвращаем task.
-    """
     app = FastAPI()
 
     @app.get("/")
@@ -58,16 +52,12 @@ def start_health_server() -> asyncio.Task:
         return {"ok": True, "service": "polling-worker"}
 
     port = int(os.getenv("PORT", "10000"))
-
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     log.info(f"[POLL] Starting health server on :{port}")
     return asyncio.create_task(server.serve())
 
-# ---- Поллинг --------------------------------------------------------
-
 async def run_polling() -> None:
-    # Инициализируем бота правильно для aiogram>=3.7 (parse_mode через DefaultBotProperties)
     bot = Bot(
         token=TELEGRAM_BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -75,28 +65,25 @@ async def run_polling() -> None:
     dp = Dispatcher()
     register_handlers(dp)
 
-    # На всякий случай очищаем вебхук и дропаем накопившиеся апдейты
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("[POLL] delete_webhook ok (drop=True)")
     except Exception as e:
         log.warning(f"[POLL] delete_webhook failed: {e}")
 
-    # Стартуем поллинг с бэкоффом на конфликт (если где-то есть второй поллер)
     backoff = 1.0
     tries = 0
     while True:
         try:
             log.info("[POLL] Starting dp.start_polling() ...")
             await dp.start_polling(bot)
-            break  # штатная остановка
+            break
         except TelegramConflictError as e:
             log.error(f"Failed to fetch updates - {e.__class__.__name__}: {e}")
             log.warning(f"Sleep for {backoff:.6f} seconds and try again... (tryings = {tries}, bot id = {bot.id})")
             await asyncio.sleep(backoff)
             tries += 1
             backoff = min(backoff * 1.3, 5.0)
-            continue
 
 async def main() -> None:
     run_ingestion_if_needed()
