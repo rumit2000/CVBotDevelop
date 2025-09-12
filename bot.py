@@ -1,9 +1,10 @@
 # bot.py
 # Телеграм-бот:
-# - кнопки (Обо мне / Скачать резюме / FAQ / LinkedIn)
-# - кэш ответов (About/FAQ)
-# - свободные вопросы: Assistants API (File Search) + универсальные tools web_search/web_fetch
-# - если ассистент не справился — общий веб-fallback и/или контакты
+# - кнопки (Обо мне / Скачать резюме / FAQ / LinkedIn — всегда видна)
+# - FAQ: свой каталог тем, на старте ответы буферизуются из резюме (через локальный RAG)
+#   темы без ответа скрываются
+# - свободные вопросы: Assistants API (File Search) + tools web_search/web_fetch
+# - если ассистент не справился — общий веб-fолбэк или контакты
 
 import asyncio
 import os
@@ -41,6 +42,7 @@ EMPTY_PATTERNS = [
     r"контекст\s+не\s+найден",
     r"релевантн(ых|ые)\s+фрагмент",
     r"контекст\s+из\s+резюме\s+не\s+найден",
+    r"\bno\s*answer\b",
 ]
 BAD_HOSTS = [
     "oshibok-net.ru", "obrazovaka.ru", "gramota.ru",
@@ -58,8 +60,51 @@ def is_empty_message(text: Optional[str]) -> bool:
     t = text.lower().replace("ё", "е")
     return any(re.search(p, t) for p in EMPTY_PATTERNS)
 
+# ========= Каталог FAQ (короткая метка для телеграма + полный запрос в модель) =========
+def hr_faq_catalog() -> List[Dict[str, str]]:
+    return [
+        {"key": "who_now", "label": "Кто вы сейчас?", "full":
+         "Кто вы сейчас? Опишите текущую роль и целевые роли (CEO / COO / CTO / CPO / Head of R&D и т.п.)."},
+        {"key": "industry", "label": "Отрасль/домен", "full":
+         "Отрасль и домен экспертизы. Примеры: FinTech, Telco, Retail, Industrial, AI/ML, GovTech и пр."},
+        {"key": "company_scale", "label": "Масштаб компании", "full":
+         "Масштаб компании: выручка/EBITDA, стадия (startup/scale-up/корпорация), число сотрудников, география."},
+        {"key": "scope", "label": "Зона ответственности", "full":
+         "Масштаб ответственности: P&L, CAPEX/OPEX, бюджет, зона (продукт/технологии/операции/продажи)."},
+        {"key": "team", "label": "Команда", "full":
+         "Команда: сколько прямых репортов, общий размер функции, уровни (VP/Director/Lead)."},
+        {"key": "skills", "label": "Ключ. компетенции", "full":
+         "Ключевые компетенции: стратегия, трансформация, M&A, оргдизайн, выход на новые рынки и т.д."},
+        {"key": "achievements", "label": "Топ-достижения", "full":
+         "Топ-достижения с цифрами (2–4 bullets): рост %, экономия $, time-to-market, NPS, SLA, ROI."},
+        {"key": "location", "label": "Локация/мобильность", "full":
+         "Локация и мобильность: город, готовность к релокации/командировкам; языки и уровень."},
+        {"key": "legal", "label": "Правовой статус", "full":
+         "Правовой статус: рабочее разрешение/гражданство, non-compete/notice period (если критично)."},
+        {"key": "pivots", "label": "Страт. развороты", "full":
+         "Стратегические развороты: какие трансформации (digital/операционная/продуктовая) и к чему привели."},
+        {"key": "from_scratch", "label": "С нуля", "full":
+         "Построение функций «с нуля»: архитектура процессов, метрики, управление (OKR/KPI, governance)."},
+        {"key": "crisis", "label": "Кризисы/антикризис", "full":
+         "Кризисы и антикризис: что починили — издержки, отток клиентов, инциденты безопасности."},
+        {"key": "global", "label": "Глобальный контекст", "full":
+         "Глобальный контекст: международные рынки/мультикультура, распределённые команды."},
+        {"key": "stakeholders", "label": "Стейкхолдеры", "full":
+         "Стейкхолдер-менеджмент: совет директоров, акционеры, регуляторы, ключевые клиенты/партнёры."},
+        {"key": "reputation", "label": "Репутация", "full":
+         "Репутация/референсы: публичные кейсы, награды, публикации, патенты, борд-роль."},
+        {"key": "pnl", "label": "P&L и результат", "full":
+         "P&L и результат: например «Отвечал за P&L $120M; EBITDA +4.2 п.п. за 12 мес»."},
+        {"key": "system", "label": "Системность", "full":
+         "Системность управления: оргдизайн, cadence, OKR, риск-менеджмент; как именно управляли."},
+        {"key": "leadership", "label": "Лидерство/кадровый резерв", "full":
+         "Лидерство и преемственность: кого вырастили, текучесть, bench strength."},
+        {"key": "change", "label": "Управление изменениями", "full":
+         "Управление изменениями: какие барьеры снимали, как измеряли эффект."},
+    ]
+
+# ========= Кэш загрузка/сохранение =========
 def load_cache():
-    """Грузим about/faq из файлов, допускаем оба формата FAQ: dict{'topics': [...]} и просто list[...]"""
     global ABOUT_TEXT, ACTIVE_FAQ_TOPICS, FAQ_CACHE
     ABOUT_TEXT, ACTIVE_FAQ_TOPICS, FAQ_CACHE = None, [], {}
 
@@ -95,14 +140,89 @@ def load_cache():
 
     print(f"[CACHE] Loaded: about={'OK' if ABOUT_TEXT else 'MISSING'}, faq_topics={len(ACTIVE_FAQ_TOPICS)}")
 
+def save_faq_cache(topics: List[Dict[str, str]]):
+    os.makedirs("data", exist_ok=True)
+    payload = {"topics": topics}
+    with open("data/faq_cache.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+# ========= Генерация ответов FAQ из локального RAG =========
+async def _answer_from_resume(full_question: str) -> Optional[str]:
+    """
+    Строим ответ строго по фрагментам резюме через локальный индекс.
+    Если данных нет — возвращаем None (кнопка будет скрыта).
+    """
+    try:
+        from rag import retrieve as rag_retrieve
+    except Exception:
+        return None
+
+    ctx = rag_retrieve(full_question, k=4)
+    if not ctx:
+        return None
+
+    # Контекст блок
+    context_block = "\n\n".join(
+        [f"Фрагмент #{i+1}:\n{frag}" for i, (frag, _) in enumerate(ctx)]
+    )
+
+    system = (
+        "Ты помощник по резюме. Отвечай ТОЛЬКО на основе предоставленных фрагментов.\n"
+        "Если информации недостаточно — выведи ровно: NO_ANSWER.\n"
+        "Если достаточно — ответь кратко и по делу, можно 3–6 буллетов с цифрами/метриками.\n"
+        "Язык ответа: русский."
+    )
+    user = f"Вопрос: {full_question}\n\nФрагменты резюме:\n{context_block}\n\nОтвет:"
+
+    client = OpenAI(api_key=settings.openai_api_key)
+    try:
+        resp = client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=0.2,
+        )
+        ans = (resp.choices[0].message.content or "").strip()
+        if not ans or "NO_ANSWER" in ans.upper() or is_empty_message(ans):
+            return None
+        return ans
+    except Exception:
+        return None
+
+async def ensure_faq_ready():
+    """
+    Если FAQ пуст — собираем каталог тем, генерим ответы из RAG, скрываем пустые,
+    сохраняем в data/faq_cache.json и грузим в оперативный кэш.
+    """
+    global ACTIVE_FAQ_TOPICS, FAQ_CACHE
+    if ACTIVE_FAQ_TOPICS and FAQ_CACHE:
+        return  # уже готово
+
+    catalog = hr_faq_catalog()
+    built: List[Dict[str, str]] = []
+
+    for item in catalog:
+        key, label, full = item["key"], item["label"], item["full"]
+        ans = await _answer_from_resume(full)
+        if ans:
+            built.append({"key": key, "label": label, "full": full, "reply": ans})
+
+    if built:
+        save_faq_cache(built)
+        # перезагрузим кэш из файла (заодно пройдём фильтры)
+        load_cache()
+    else:
+        # пусть FAQ останется пустым — кнопки тем не будет, но верхняя FAQ-кнопка остаётся
+        ACTIVE_FAQ_TOPICS, FAQ_CACHE = [], {}
+
 # ========= Кнопочные клавиатуры =========
 def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Обо мне", callback_data="about")
     kb.button(text="Скачать резюме", callback_data="resume")
 
-    if ACTIVE_FAQ_TOPICS:
-        kb.button(text="FAQ от HR", callback_data="faq_menu")
+    # FAQ-кнопка теперь ВСЕГДА есть
+    kb.button(text="FAQ от HR", callback_data="faq_menu")
 
     link = (settings.linkedin_url or "").strip()
     if link:
@@ -118,7 +238,14 @@ def main_kb() -> InlineKeyboardMarkup:
 def faq_kb(page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
     topics = ACTIVE_FAQ_TOPICS
     total = len(topics)
-    total_pages = (total - 1) // per_page + 1 if total else 1
+    if total == 0:
+        # Пустой — вернём заглушку «Закрыть»
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Закрыть", callback_data="faq_close")
+        kb.adjust(1)
+        return kb.as_markup()
+
+    total_pages = (total - 1) // per_page + 1
     page = max(0, min(page, total_pages - 1))
     start, end = page * per_page, min(page * per_page + per_page, total)
 
@@ -174,10 +301,6 @@ async def is_question_relevant(question: str) -> bool:
 
 # ========= Вспомогательное: вытащить текущую компанию из резюме (локально) =========
 async def extract_current_company_from_local_index() -> Optional[str]:
-    """
-    Берём из локального RAG текущего работодателя (последняя позиция).
-    Возвращаем строку Company или None.
-    """
     try:
         from rag import retrieve as _retrieve
     except Exception:
@@ -249,10 +372,6 @@ def _web_fetch_impl(url: str, max_chars: int = 4000) -> dict:
 
 # ========= Assistants API: универсальный раннер с обработкой tools =========
 async def answer_via_assistant(question: str) -> Optional[str]:
-    """
-    Ассистент (File Search + tools). Если ассистент вызывает web_search без компании в вопросах headcount —
-    подставим компанию, извлечённую из резюме.
-    """
     if not settings.assistant_id:
         return None
 
@@ -262,7 +381,6 @@ async def answer_via_assistant(question: str) -> Optional[str]:
         client.beta.threads.messages.create(thread_id=thread.id, role="user", content=question)
         run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=settings.assistant_id)
 
-        # заранее достанем текущую компанию из локального индекса
         current_company = await extract_current_company_from_local_index()
 
         while True:
@@ -285,13 +403,11 @@ async def answer_via_assistant(question: str) -> Optional[str]:
                     if name == "web_search":
                         q = (args.get("query") or "").strip()
                         k = int(args.get("max_results", 5))
-                        # если похоже на headcount, но нет названия компании — добавим его
                         headcount_trigger = any(s in q.lower() for s in [
                             "headcount","employee","employees","численност","штат","размер компан","сколько человек"
                         ])
                         if headcount_trigger and current_company and current_company.lower() not in q.lower():
                             q = f'{current_company} employees headcount численность сотрудников штат размер компании'
-
                         results = _web_search_impl(q, max_results=k)
                         outputs.append({"tool_call_id": call.id,
                                         "output": json.dumps(results, ensure_ascii=False)})
@@ -324,7 +440,6 @@ async def answer_via_assistant(question: str) -> Optional[str]:
                         return answer or None
                 return None
 
-            # cancelled/failed/expired
             return None
     except Exception:
         return None
@@ -375,6 +490,8 @@ async def handle_reindex(message: types.Message):
         import ingestion
         await asyncio.get_running_loop().run_in_executor(None, ingestion.main)
         load_cache()
+        # после переиндексации пересоберём FAQ
+        await ensure_faq_ready()
         await message.answer("Переиндексация и кэш обновлены ✅", reply_markup=main_kb())
     except Exception as e:
         await message.answer(f"Ошибка переиндексации: {e}")
@@ -385,20 +502,17 @@ async def handle_free_text(message: types.Message):
         await message.answer("Пришлите текст вопроса, пожалуйста.", reply_markup=main_kb())
         return
 
-    # 1) фильтр на релевантность собеседованию
     if not await is_question_relevant(question):
         msg = ("Этот вопрос не относится к тематике собеседования и моему резюме. "
                f"По организационным или личным вопросам лучше связаться со мной: {settings.contact_info}")
         await message.answer(msg, reply_markup=main_kb())
         return
 
-    # 2) сначала — ассистент (File Search → при необходимости web_search/web_fetch)
     ans = await answer_via_assistant(question)
     if ans and not is_empty_message(ans):
         await message.answer(ans, reply_markup=main_kb())
         return
 
-    # 3) общий веб-fallback (на всякий случай)
     links = []
     try:
         with DDGS() as ddgs:
@@ -427,32 +541,35 @@ async def handle_free_text(message: types.Message):
 # ========= Callback-хендлеры =========
 async def cb_about(callback: CallbackQuery):
     await handle_about(callback.message)
-    try: await callback.answer()
-    except Exception: pass
+    with contextlib_sup():
+        await callback.answer()
 
 async def cb_resume(callback: CallbackQuery):
     await handle_resume(callback.message)
-    try: await callback.answer()
-    except Exception: pass
+    with contextlib_sup():
+        await callback.answer()
 
 async def cb_linkedin(callback: CallbackQuery):
     await handle_linkedin(callback.message)
-    try: await callback.answer()
-    except Exception: pass
+    with contextlib_sup():
+        await callback.answer()
 
 async def cb_faq_menu(callback: CallbackQuery):
-    # показать меню тем
+    # если по какой-то причине кэш пуст — попробуем собрать прямо сейчас
+    if not ACTIVE_FAQ_TOPICS:
+        await ensure_faq_ready()
     if not ACTIVE_FAQ_TOPICS:
         await callback.message.answer("Сейчас нет доступных FAQ по резюме. " + CTA, reply_markup=main_kb())
-        try: await callback.answer()
-        except Exception: pass
+        with contextlib_sup():
+            await callback.answer()
         return
+
     await callback.message.answer(
         "Часто задаваемые вопросы от HR — выберите тему (или задайте вопрос текстом):",
         reply_markup=faq_kb(0)
     )
-    try: await callback.answer()
-    except Exception: pass
+    with contextlib_sup():
+        await callback.answer()
 
 async def cb_faq_page(callback: CallbackQuery):
     try:
@@ -463,32 +580,40 @@ async def cb_faq_page(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=faq_kb(page))
     except Exception:
         await callback.message.answer("Часто задаваемые вопросы от HR — выберите тему:", reply_markup=faq_kb(page))
-    try: await callback.answer()
-    except Exception: pass
+    with contextlib_sup():
+        await callback.answer()
 
 async def cb_faq_topic(callback: CallbackQuery):
     key = (callback.data.split(":", 1)[1] if ":" in (callback.data or "") else "").strip()
     if not key or key not in FAQ_CACHE:
-        try: await callback.answer("По этой теме нет ответа в кэше.", show_alert=True)
-        except Exception: pass
+        with contextlib_sup():
+            await callback.answer("По этой теме нет ответа в кэше.", show_alert=True)
         return
     label = next((lbl for k, lbl, _ in ACTIVE_FAQ_TOPICS if k == key), "Ответ")
     await callback.message.answer(f"{label}:\n\n{FAQ_CACHE[key]}", reply_markup=main_kb())
-    try: await callback.answer()
-    except Exception: pass
+    with contextlib_sup():
+        await callback.answer()
 
 async def cb_faq_close(callback: CallbackQuery):
-    try:
+    with contextlib_sup():
         await callback.message.delete()
+        await callback.answer()
+
+# ========= Вспомогательное подавление исключений для callback.answer() =========
+from contextlib import contextmanager
+@contextmanager
+def contextlib_sup():
+    try:
+        yield
     except Exception:
         pass
-    try: await callback.answer()
-    except Exception: pass
 
 # ========= Startup & registration =========
 async def on_startup():
     load_cache()
-    print("[STARTUP] Cache loaded (no heavy LLM calls).")
+    # Соберём FAQ, если он пуст (или файл отсутствует)
+    await ensure_faq_ready()
+    print("[STARTUP] Cache loaded; FAQ ready.")
 
 def register_handlers(dp: Dispatcher):
     dp.startup.register(on_startup)

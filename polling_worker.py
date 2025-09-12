@@ -13,11 +13,8 @@ from fastapi import FastAPI
 import uvicorn
 
 from config import settings
+from bot import register_handlers, load_cache  # регистрация хэндлеров и кэш
 
-# импортируем регистрацию хэндлеров из bot.py
-from bot import register_handlers, load_cache
-
-# ---------- Логирование ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -58,13 +55,11 @@ async def run_polling():
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
-    register_handlers(dp)      # все хэндлеры из bot.py
-    load_cache()               # подстраховка
+    register_handlers(dp)
+    load_cache()  # подстраховка
 
-    # Явно укажем типы апдейтов, чтобы точно получать callback_query
     allowed = ["message", "callback_query"]
 
-    # Экспоненциальный бэкофф на случай конфликтов
     delay = 1.0
     while True:
         try:
@@ -81,13 +76,11 @@ async def run_polling():
             await asyncio.sleep(2.0)
             continue
         finally:
-            # dp.start_polling возвращается только при остановке
             log.info("Polling stopped")
             with suppress(Exception):
                 await bot.session.close()
 
 async def main():
-    # Если кэша ещё нет — запустим ingestion один раз
     need_about = not os.path.exists("data/about_cache.txt")
     need_faq = not os.path.exists("data/faq_cache.json")
     if need_about or need_faq:
@@ -96,7 +89,6 @@ async def main():
             import ingestion
             await asyncio.get_running_loop().run_in_executor(None, ingestion.main)
 
-    # параллельно health-сервер и polling
     poll = asyncio.create_task(run_polling())
     health = asyncio.create_task(run_health_server())
     done, pending = await asyncio.wait({poll, health}, return_when=asyncio.FIRST_EXCEPTION)
