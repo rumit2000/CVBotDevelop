@@ -60,7 +60,7 @@ def is_empty_message(text: Optional[str]) -> bool:
     t = text.lower().replace("ё", "е")
     return any(re.search(p, t) for p in EMPTY_PATTERNS)
 
-# ========= Каталог FAQ (короткая метка для телеграма + полный запрос в модель) =========
+# ========= Каталог FAQ =========
 def hr_faq_catalog() -> List[Dict[str, str]]:
     return [
         {"key": "who_now", "label": "Кто вы сейчас?", "full":
@@ -148,10 +148,6 @@ def save_faq_cache(topics: List[Dict[str, str]]):
 
 # ========= Нормализация результата RAG =========
 def _norm_ctx(ctx: Any, limit: int = 5) -> List[str]:
-    """
-    Принимает что угодно (строки/списки/кортежи/словари) и возвращает
-    список строк-фрагментов. Безопасно к любым форматам rag.retrieve().
-    """
     out: List[str] = []
     if ctx is None:
         return out
@@ -161,7 +157,6 @@ def _norm_ctx(ctx: Any, limit: int = 5) -> List[str]:
         if isinstance(item, str):
             text = item
         elif isinstance(item, (list, tuple)) and len(item) >= 1:
-            # чаще всего (text, score, ...). Берём первый элемент
             if isinstance(item[0], str):
                 text = item[0]
         elif isinstance(item, dict):
@@ -178,11 +173,24 @@ def _norm_ctx(ctx: Any, limit: int = 5) -> List[str]:
             break
     return out
 
+def _prefer_company(frags: List[str], company: str) -> List[str]:
+    """Отфильтровать фрагменты по нужной компании (если есть совпадения)."""
+    if not company:
+        return frags
+    kw = company.lower()
+    extra = []
+    if kw in ("сбер", "сбербанк"):
+        extra = ["сбербанк", "сбер", "sber", "sberbank"]
+    keys = set([kw] + extra)
+    picked = [f for f in frags if any(k in f.lower() for k in keys)]
+    return picked if picked else frags
+
 # ========= Генерация ответов FAQ из локального RAG =========
-async def _answer_from_resume(full_question: str) -> Optional[str]:
+async def _answer_from_resume(full_question: str, prefer_company: Optional[str] = None) -> Optional[str]:
     """
     Строим ответ строго по фрагментам резюме через локальный индекс.
     Если данных нет — возвращаем None (кнопка будет скрыта).
+    Опционально фокусируемся на конкретной компании (prefer_company).
     """
     try:
         from rag import retrieve as rag_retrieve
@@ -194,11 +202,14 @@ async def _answer_from_resume(full_question: str) -> Optional[str]:
     except Exception:
         return None
 
-    frags = _norm_ctx(ctx_raw, limit=5)
+    frags = _norm_ctx(ctx_raw, limit=8)
     if not frags:
         return None
 
-    context_block = "\n\n".join([f"Фрагмент #{i+1}:\n{frag}" for i, frag in enumerate(frags)])
+    if prefer_company:
+        frags = _prefer_company(frags, prefer_company)
+
+    context_block = "\n\n".join([f"Фрагмент #{i+1}:\n{frag}" for i, frag in enumerate(frags[:5])])
 
     system = (
         "Ты помощник по резюме. Отвечай ТОЛЬКО на основе предоставленных фрагментов.\n"
@@ -227,6 +238,7 @@ async def ensure_faq_ready():
     """
     Если FAQ пуст — собираем каталог тем, генерим ответы из RAG, скрываем пустые,
     сохраняем в data/faq_cache.json и грузим в оперативный кэш.
+    Для темы 'Масштаб компании' специально фокусируемся на Сбере.
     """
     global ACTIVE_FAQ_TOPICS, FAQ_CACHE
     if ACTIVE_FAQ_TOPICS and FAQ_CACHE:
@@ -237,7 +249,8 @@ async def ensure_faq_ready():
 
     for item in catalog:
         key, label, full = item["key"], item["label"], item["full"]
-        ans = await _answer_from_resume(full)
+        prefer = "Сбер" if key == "company_scale" else None
+        ans = await _answer_from_resume(full, prefer_company=prefer)
         if ans:
             built.append({"key": key, "label": label, "full": full, "reply": ans})
 
@@ -328,7 +341,7 @@ async def classify_interview_relevance(question: str) -> bool:
 async def is_question_relevant(question: str) -> bool:
     return rule_based_interview_relevance(question) or await classify_interview_relevance(question)
 
-# ========= Вспомогательное: вытащить текущую компанию из резюме (локально) =========
+# ========= Вспомогательное: текущая компания из RAG =========
 async def extract_current_company_from_local_index() -> Optional[str]:
     try:
         from rag import retrieve as _retrieve
@@ -401,7 +414,7 @@ def _web_fetch_impl(url: str, max_chars: int = 4000) -> dict:
     except Exception:
         return {"url": url, "text": ""}
 
-# ========= Assistants API: универсальный раннер с обработкой tools =========
+# ========= Assistants API: раннер с tools =========
 async def answer_via_assistant(question: str) -> Optional[str]:
     if not settings.assistant_id:
         return None
@@ -569,6 +582,14 @@ async def handle_free_text(message: types.Message):
     await message.answer(txt, reply_markup=main_kb())
 
 # ========= Callback-хендлеры =========
+from contextlib import contextmanager
+@contextmanager
+def contextlib_sup():
+    try:
+        yield
+    except Exception:
+        pass
+
 async def cb_about(callback: CallbackQuery):
     await handle_about(callback.message)
     with contextlib_sup():
@@ -627,15 +648,6 @@ async def cb_faq_close(callback: CallbackQuery):
     with contextlib_sup():
         await callback.message.delete()
         await callback.answer()
-
-# ========= Вспомогательное подавление исключений для callback.answer() =========
-from contextlib import contextmanager
-@contextmanager
-def contextlib_sup():
-    try:
-        yield
-    except Exception:
-        pass
 
 # ========= Startup & registration =========
 async def on_startup():
