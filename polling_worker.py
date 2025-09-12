@@ -1,103 +1,110 @@
 # polling_worker.py
-# Воркер для Render: health-сервер на $PORT + лонг-поллинг Telegram (без вебхука).
-# Подключает боевые хэндлеры из bot.py. Токен берётся из TELEGRAM_BOT_TOKEN.
+# Long-polling воркер + мини health-сервер для Render
 
-import os
-import sys
 import asyncio
 import logging
-import subprocess
-from pathlib import Path
+import os
+from contextlib import suppress
 
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramConflictError
 from fastapi import FastAPI
 import uvicorn
 
-from aiogram import Dispatcher, Bot
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramConflictError
+from config import settings
 
-from bot import register_handlers
+# импортируем регистрацию хэндлеров из bot.py
+from bot import register_handlers, load_cache
 
+# ---------- Логирование ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
-log = logging.getLogger("[POLL]")
+log = logging.getLogger("polling_worker")
 
-DATA_DIR = Path("data")
-ABOUT_FILE = DATA_DIR / "about_cache.txt"
+# ---------- Health-сервер ----------
+app = FastAPI()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-if not TELEGRAM_BOT_TOKEN:
-    print("[POLL] ERROR: TELEGRAM_BOT_TOKEN не задан")
-    sys.exit(1)
+@app.get("/")
+def root():
+    return {"ok": True, "service": "cvbot", "mode": "polling"}
 
-def run_ingestion_if_needed() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not ABOUT_FILE.exists():
-        log.info("[POLL] No cache detected. Running ingestion...")
-        try:
-            ret = subprocess.run([sys.executable, "ingestion.py"], check=False)
-            if ret.returncode != 0:
-                log.warning("[POLL] ingestion.py exited with non-zero code, continue anyway")
-        except Exception as e:
-            log.warning(f"[POLL] ingestion failed: {e}")
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
 
-def start_health_server() -> asyncio.Task:
-    app = FastAPI()
-
-    @app.get("/")
-    def root():
-        return {"ok": True, "service": "polling-worker"}
-
-    port = int(os.getenv("PORT", "10000"))
+async def run_health_server():
+    port = int(os.getenv("PORT", "10000") or "10000")
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
-    log.info(f"[POLL] Starting health server on :{port}")
-    return asyncio.create_task(server.serve())
+    await server.serve()
 
-async def run_polling() -> None:
-    bot = Bot(
-        token=TELEGRAM_BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher()
-    register_handlers(dp)
-
-    try:
+# ---------- Запуск polling ----------
+async def delete_webhook_safe(token: str):
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    with suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
-        log.info("[POLL] delete_webhook ok (drop=True)")
-    except Exception as e:
-        log.warning(f"[POLL] delete_webhook failed: {e}")
+    await bot.session.close()
 
-    backoff = 1.0
-    tries = 0
+async def run_polling():
+    token = (settings.telegram_token or "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+
+    # сброс вебхука и дропа подвисших апдейтов
+    await delete_webhook_safe(token)
+
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher()
+    register_handlers(dp)      # все хэндлеры из bot.py
+    load_cache()               # подстраховка
+
+    # Явно укажем типы апдейтов, чтобы точно получать callback_query
+    allowed = ["message", "callback_query"]
+
+    # Экспоненциальный бэкофф на случай конфликтов
+    delay = 1.0
     while True:
         try:
             log.info("[POLL] Starting dp.start_polling() ...")
-            await dp.start_polling(bot)
-            break
+            await dp.start_polling(bot, allowed_updates=allowed)
         except TelegramConflictError as e:
-            log.error(f"Failed to fetch updates - {e.__class__.__name__}: {e}")
-            log.warning(f"Sleep for {backoff:.6f} seconds and try again... (tryings = {tries}, bot id = {bot.id})")
-            await asyncio.sleep(backoff)
-            tries += 1
-            backoff = min(backoff * 1.3, 5.0)
+            log.error("Failed to fetch updates - %s", e)
+            log.warning("Sleep for %.6f seconds and try again...", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.3, 5.5)
+            continue
+        except Exception as e:
+            log.exception("Polling crashed: %s", e)
+            await asyncio.sleep(2.0)
+            continue
+        finally:
+            # dp.start_polling возвращается только при остановке
+            log.info("Polling stopped")
+            with suppress(Exception):
+                await bot.session.close()
 
-async def main() -> None:
-    run_ingestion_if_needed()
-    health_task = start_health_server()
-    try:
-        await run_polling()
-    finally:
-        try:
-            health_task.cancel()
-        except Exception:
-            pass
+async def main():
+    # Если кэша ещё нет — запустим ingestion один раз
+    need_about = not os.path.exists("data/about_cache.txt")
+    need_faq = not os.path.exists("data/faq_cache.json")
+    if need_about or need_faq:
+        log.info("[POLL] No cache detected. Running ingestion...")
+        with suppress(Exception):
+            import ingestion
+            await asyncio.get_running_loop().run_in_executor(None, ingestion.main)
+
+    # параллельно health-сервер и polling
+    poll = asyncio.create_task(run_polling())
+    health = asyncio.create_task(run_health_server())
+    done, pending = await asyncio.wait({poll, health}, return_when=asyncio.FIRST_EXCEPTION)
+    for t in pending:
+        t.cancel()
+    for t in done:
+        with suppress(Exception):
+            t.result()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.warning("Interrupted by user")
+    asyncio.run(main())
