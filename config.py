@@ -16,7 +16,7 @@ class Settings:
     # Resume / Links
     resume_path: str = os.getenv("RESUME_PATH", "data/CVTimurAsyaev.pdf").strip()
     linkedin_url: str = os.getenv("LINKEDIN_URL", "").strip()
-    contact_info: str = os.getenv("CONTACT_INFO", "@your_tg • email@example.com").strip()
+    contact_info: str = os.getenv("CONTACT_INFO", "@TimurAsyaev • rumit2000@gmail.com").strip()
 
     # (для совместимости — не используются в long-polling)
     base_webhook_url: str = os.getenv("BASE_WEBHOOK_URL", "").strip()
