@@ -1,17 +1,15 @@
 
 # bot.py
-# Телеграм-бот:
-# - кнопки (Обо мне / Скачать резюме / FAQ / LinkedIn — всегда видна)
-# - FAQ: свой каталог тем, на старте ответы буферизуются из резюме (через локальный RAG)
-#   темы без ответа скрываются
-# - свободные вопросы: Assistants API (File Search) + tools web_search/web_fetch
-# - если ассистент не справился — общий веб-фолбэк или контакты
+# Кнопки (Обо мне / Скачать полное резюме / Скачать OnePageCV / FAQ от HR / LinkedIn)
+# FAQ показывается, только если в кэше есть темы. На старте при отсутствии кэша — бот сам
+# пытется прогреть его через ingestion и перезагружает.
 
 import asyncio
 import os
+import sys
 import json
 import re
-from typing import List, Tuple, Dict, Optional, Set
+from typing import List, Tuple, Dict, Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -25,18 +23,14 @@ from lxml import html as lxml_html
 
 from config import settings
 
-# ========= Глобальные кэши =========
+# ========= Кэш =========
 ABOUT_TEXT: Optional[str] = None
 ACTIVE_FAQ_TOPICS: List[Tuple[str, str, str]] = []
 FAQ_CACHE: Dict[str, str] = {}
 
 CTA = "Вы также можете задать вопрос на естественном языке."
 
-def contextlib_sup():
-    from contextlib import suppress
-    return suppress(Exception)
-
-# ========= Эвристики / фильтры =========
+# ========= Эвристики =========
 EMPTY_PATTERNS = [
     r"нет\s+(конкретной\s+)?информаци",
     r"в\s+(резюме|контексте|фрагмент(ах)?|предоставленных\s+фрагмент(ах)?)\s+нет",
@@ -48,15 +42,8 @@ EMPTY_PATTERNS = [
     r"релевантн(ых|ые)\s+фрагмент",
     r"контекст\s+из\s+резюме\s+не\s+найден",
 ]
-BAD_HOSTS = [
-    "oshibok-net.ru", "obrazovaka.ru", "gramota.ru",
-    "rus.stackexchange.com", "stackexchange.com"
-]
+BAD_HOSTS = ["oshibok-net.ru", "obrazovaka.ru", "gramota.ru", "rus.stackexchange.com", "stackexchange.com"]
 BAD_URL_PARTS = ["login", "signin", "auth", "callback", "account", "microsoftonline", "oauth", "sso"]
-EMPLOYEE_KEYWORDS = [
-    "employees","employee count","headcount","staff","team size",
-    "сотрудник","сотрудников","численность","штат","размер компании"
-]
 
 def is_empty_message(text: Optional[str]) -> bool:
     if not text or not text.strip():
@@ -64,6 +51,7 @@ def is_empty_message(text: Optional[str]) -> bool:
     t = text.lower().replace("ё", "е")
     return any(re.search(p, t) for p in EMPTY_PATTERNS)
 
+# ========= Кэш: загрузка =========
 def load_cache():
     global ABOUT_TEXT, ACTIVE_FAQ_TOPICS, FAQ_CACHE
     ABOUT_TEXT, ACTIVE_FAQ_TOPICS, FAQ_CACHE = None, [], {}
@@ -91,7 +79,7 @@ def load_cache():
 
     print(f"[CACHE] Loaded: about={'OK' if ABOUT_TEXT else 'MISSING'}, faq_topics={len(ACTIVE_FAQ_TOPICS)}")
 
-# ========= Кнопочные клавиатуры =========
+# ========= Клавиатуры =========
 def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Обо мне", callback_data="about")
@@ -126,89 +114,24 @@ def faq_kb(page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
     kb.adjust(1)
     return kb.as_markup()
 
-# ========= Релевантность к собеседованию =========
-HR_PATTERNS = [
-    r"\bкомпан[ияие]\b", r"\bгде\s+сейчас\s+работа", r"\bтекущ\w+\s+(роль|должн|позици)",
-    r"\bразмер\w*\b", r"\bштат\w*\b", r"\bсотрудник\w*\b", r"\bheadcount\b",
-    r"\bвыручк\w*\b", r"\bоборот\w*\b", r"\bebitda\b", r"p&l", r"\bбюджет\w*\b", r"\bbudget\b",
-    r"\bкоманда\b|\bteam\b|\bрепорт\w*|\bподчиненн\w*",
-    r"\bопыт\w*\b|\bresponsibilit|\bобязанност\w*|\bответственност\w*",
-    r"\bиндустри\w*|\bдомен\w*|\bindustr\w*|\bdomain\b|\bfintech\b|\btelco\b|\bretail\b|\bindustrial\b|\bai/ml\b|\bgovtech\b",
-    r"\bрелокац\w*|\bкомандировк\w*|\bмобильност\w*|\brelocat\w*|\bvisa\b|\bwork\s+permit\b|\bгражданств\w*",
-    r"\bзарплат\w*|\bcompensation\b|\bbenefit\w*|\bequity\b|\bопцион\w*",
-    r"\bokrs?\b|\bkpis?\b|\borg\s*design\b|\bgovernance\b",
-]
-def rule_based_interview_relevance(q: str) -> bool:
-    qn = q.lower()
-    return any(re.search(p, qn) for p in HR_PATTERNS)
+# ========= Веб-поиск/загрузка =========
+from ddgs import DDGS
+import httpx
+from lxml import html as lxml_html
 
-async def classify_interview_relevance(question: str) -> bool:
-    client = OpenAI(api_key=settings.openai_api_key)
-    messages = [
-        {"role": "system", "content": (
-            "You are a strict classifier. Output only 'yes' or 'no'. "
-            "Say 'yes' if the user's question is related to a job interview context: "
-            "professional experience, roles, responsibilities, skills, achievements, compensation/relocation, "
-            "work authorization, management, org design, strategy, product/tech/operations, leadership, "
-            "stakeholders, budgets/P&L, results, industry/domain, company size, team size."
-        )},
-        {"role": "user", "content": question}
-    ]
-    try:
-        resp = client.chat.completions.create(model=settings.openai_model, messages=messages, temperature=0)
-        return resp.choices[0].message.content.strip().lower().startswith("y")
-    except Exception:
-        return True
-
-async def is_question_relevant(question: str) -> bool:
-    return rule_based_interview_relevance(question) or await classify_interview_relevance(question)
-
-# ========= Вспомогательное: вытащить текущую компанию из резюме (локально) =========
-async def extract_current_company_from_local_index() -> Optional[str]:
-    """
-    Берём из локального RAG текущего работодателя (последняя позиция).
-    Возвращаем строку Company или None.
-    """
-    from rag import retrieve as _retrieve
-    ctx = _retrieve("Текущее место работы: укажи название компании и должность (если есть).")
-    if not ctx:
-        return None
-    context_block = "\n\n".join([f"Фрагмент #{i+1}:\n{frag}" for i, frag in enumerate(ctx)])
-    system = (
-        "Ты — экстрактор фактов из резюме. Верни строго JSON: "
-        '{"company": "..."} без пояснений. Если не уверен — используй null.'
-    )
-    user = f"Фрагменты резюме:\n\n{context_block}\n\nВерни только JSON."
-    client = OpenAI(api_key=settings.openai_api_key)
-    try:
-        resp = client.chat.completions.create(
-            model=settings.openai_model,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0
-        )
-        m = re.search(r"\{.*\}", resp.choices[0].message.content.strip(), flags=re.S)
-        data = json.loads(m.group(0)) if m else {}
-        comp = (data.get("company") or "").strip().strip('"“”«»')
-        return comp or None
-    except Exception:
-        return None
-
-# ========= Универсальный веб-поиск и загрузка =========
-def _web_search_impl(query: str, max_results: int = 5) -> List[dict]:
+def _web_search_impl(query: str, max_results: int = 5):
     out = []
     try:
         with DDGS() as ddgs:
             for r in ddgs.text(query, region="ru-ru", safesearch="moderate", max_results=25):
                 title = r.get("title") or r.get("source") or "Источник"
-                url   = (r.get("href") or r.get("url") or r.get("link") or "").strip()
-                body  = r.get("body") or ""
+                url = (r.get("href") or r.get("url") or r.get("link") or "").strip()
+                body = r.get("body") or ""
                 if not url:
                     continue
                 ul = url.lower()
-                if any(bad in ul for bad in BAD_HOSTS):
-                    continue
-                if any(part in ul for part in BAD_URL_PARTS):
-                    continue
+                if any(bad in ul for bad in BAD_HOSTS): continue
+                if any(part in ul for part in BAD_URL_PARTS): continue
                 out.append({"title": title, "url": url, "snippet": body})
                 if len(out) >= max_results:
                     break
@@ -219,14 +142,14 @@ def _web_search_impl(query: str, max_results: int = 5) -> List[dict]:
 def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
-def _web_fetch_impl(url: str, max_chars: int = 4000) -> dict:
+def _web_fetch_impl(url: str, max_chars: int = 4000):
     try:
-        with httpx.Client(follow_redirects=True, timeout=12.0,
-                          headers={"User-Agent": "Mozilla/5.0"}) as c:
+        with httpx.Client(follow_redirects=True, timeout=12.0, headers={"User-Agent": "Mozilla/5.0"}) as c:
             resp = c.get(url)
             resp.raise_for_status()
             if any(part in resp.url.lower() for part in BAD_URL_PARTS):
                 return {"url": url, "text": ""}
+            from lxml import html as lxml_html
             doc = lxml_html.fromstring(resp.text)
             for bad in doc.xpath('//script|//style|//noscript'):
                 bad.drop_tree()
@@ -235,70 +158,43 @@ def _web_fetch_impl(url: str, max_chars: int = 4000) -> dict:
     except Exception:
         return {"url": url, "text": ""}
 
-# ========= Assistants API: универсальный раннер с обработкой tools =========
+# ========= Assistants API =========
+from openai import OpenAI
 async def answer_via_assistant(question: str) -> Optional[str]:
-    """
-    Ассистент (File Search + tools). Если ассистент вызывает web_search без компании в вопросах headcount —
-    подставим компанию, извлечённую из резюме.
-    """
     if not settings.assistant_id:
         return None
-
     client = OpenAI(api_key=settings.openai_api_key)
     try:
         thread = client.beta.threads.create()
         client.beta.threads.messages.create(thread_id=thread.id, role="user", content=question)
         run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=settings.assistant_id)
-
-        # заранее достанем текущую компанию из локального индекса
-        current_company = await extract_current_company_from_local_index()
-
         while True:
             await asyncio.sleep(0.8)
             run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-
             if run.status in ("queued", "in_progress"):
                 continue
-
             if run.status == "requires_action":
-                tool_calls = run.required_action.submit_tool_outputs.tool_calls
                 outputs = []
-                for call in tool_calls:
+                for call in run.required_action.submit_tool_outputs.tool_calls:
                     name = call.function.name
                     try:
                         args = json.loads(call.function.arguments or "{}")
                     except Exception:
                         args = {}
-
                     if name == "web_search":
                         q = (args.get("query") or "").strip()
                         k = int(args.get("max_results", 5))
-                        headcount_trigger = any(s in q.lower() for s in [
-                            "headcount","employee","employees","численност","штат","размер компан","сколько человек"
-                        ])
-                        if headcount_trigger and current_company and current_company.lower() not in q.lower():
-                            q = f'{current_company} employees headcount численность сотрудников штат размер компании'
-
                         results = _web_search_impl(q, max_results=k)
-                        outputs.append({"tool_call_id": call.id,
-                                        "output": json.dumps(results, ensure_ascii=False)})
-
+                        outputs.append({"tool_call_id": call.id, "output": json.dumps(results, ensure_ascii=False)})
                     elif name == "web_fetch":
                         url = (args.get("url") or "").strip()
                         max_chars = int(args.get("max_chars", 4000))
                         result = _web_fetch_impl(url, max_chars=max_chars)
-                        outputs.append({"tool_call_id": call.id,
-                                        "output": json.dumps(result, ensure_ascii=False)})
-
+                        outputs.append({"tool_call_id": call.id, "output": json.dumps(result, ensure_ascii=False)})
                     else:
-                        outputs.append({"tool_call_id": call.id,
-                                        "output": json.dumps({"error": "unknown tool"})})
-
-                run = client.beta.threads.runs.submit_tool_outputs(
-                    thread_id=thread.id, run_id=run.id, tool_outputs=outputs
-                )
+                        outputs.append({"tool_call_id": call.id, "output": json.dumps({"error": "unknown tool"})})
+                client.beta.threads.runs.submit_tool_outputs(thread_id=thread.id, run_id=run.id, tool_outputs=outputs)
                 continue
-
             if run.status == "completed":
                 msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=10)
                 for m in msgs.data:
@@ -310,13 +206,11 @@ async def answer_via_assistant(question: str) -> Optional[str]:
                         answer = "\n".join(parts).strip()
                         return answer or None
                 return None
-
-            # cancelled/failed/expired
             return None
     except Exception:
         return None
 
-# ========= Обработчики сообщений =========
+# ========= Обработчики =========
 async def handle_start(message: types.Message):
     if ABOUT_TEXT:
         intro = "Вы общаетесь с цифровым аватаром резюме Тимура Асяева.\n\n"
@@ -349,13 +243,10 @@ async def handle_resume_onepage(message: types.Message):
     if not os.path.exists(settings.resume_onepage_path):
         await message.answer("Файл OnePageCV не найден на сервере.")
         return
-    try:
-        await message.answer_document(
-            FSInputFile(settings.resume_onepage_path, filename="CVTimurAsyaevOnePage.pdf"),
-            caption="OnePageCV Тимура Асяева (PDF).\n\n" + CTA
-        )
-    except Exception as e:
-        await message.answer(f"Не удалось отправить OnePageCV: {e}")
+    await message.answer_document(
+        FSInputFile(settings.resume_onepage_path, filename="CVTimurAsyaevOnePage.pdf"),
+        caption="OnePageCV Тимура Асяева (PDF).\n\n" + CTA
+    )
 
 async def handle_linkedin(message: types.Message):
     if settings.linkedin_url:
@@ -368,108 +259,96 @@ async def handle_reindex(message: types.Message):
         await message.answer("Команда доступна только владельцу."); return
     await message.answer("Начинаю переиндексацию…")
     try:
-        import ingestion
-        await asyncio.get_running_loop().run_in_executor(None, ingestion.main)
+        def _run():
+            # Надёжный вызов: сначала subprocess, потом импортом
+            try:
+                import subprocess
+                subprocess.run([sys.executable, "ingestion.py"], check=True)
+            except Exception:
+                import importlib
+                ingestion = importlib.import_module("ingestion")
+                if hasattr(ingestion, "main"):
+                    ingestion.main()
+        await asyncio.get_running_loop().run_in_executor(None, _run)
         load_cache()
         await message.answer("Переиндексация и кэш обновлены ✅", reply_markup=main_kb())
     except Exception as e:
         await message.answer(f"Ошибка переиндексации: {e}")
 
 async def handle_free_text(message: types.Message):
-    question = message.text.strip()
-
-    # 1) фильтр на релевантность собеседованию
-    if not await is_question_relevant(question):
-        msg = ("Этот вопрос не относится к тематике собеседования и моему резюме. "
-               f"По организационным или личным вопросам лучше связаться со мной: {settings.contact_info}")
-        await message.answer(msg, reply_markup=main_kb())
-        return
-
-    # 2) сначала — ассистент (File Search → при необходимости web_search/web_fetch)
+    question = (message.text or "").strip()
     ans = await answer_via_assistant(question)
     if ans and not is_empty_message(ans):
-        await message.answer(ans, reply_markup=main_kb())
-        return
+        await message.answer(ans, reply_markup=main_kb()); return
+    await message.answer("⚠️ Прямого ответа в файлах резюме нет. Задайте вопрос точнее или свяжитесь со мной напрямую.", reply_markup=main_kb())
 
-    # 3) общий веб-fallback (на всякий случай)
-    links = []
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(question, region="ru-ru", safesearch="moderate", max_results=10):
-                title = r.get("title") or r.get("source") or "Источник"
-                url   = r.get("href")  or r.get("url")    or r.get("link")
-                if not url: continue
-                ul = (url or "").lower()
-                if any(bad in ul for bad in BAD_HOSTS): continue
-                if any(part in ul for part in BAD_URL_PARTS): continue
-                links.append((title, url))
-                if len(links) >= 3: break
-    except Exception:
-        pass
+# ========= Callback =========
+async def cb_about(c: CallbackQuery):
+    await handle_about(c.message); await c.answer()
 
-    if links:
-        bullets = "\n".join([f"- {t} ({u})" for t, u in links])
-        txt = ("⚠️ В файлах резюме прямого ответа нет.\n\n"
-               f"Нашёл полезные источники:\n{bullets}\n\n"
-               f"Если потребуется уточнить детали, свяжитесь со мной: {settings.contact_info}")
-    else:
-        txt = ("⚠️ В файлах резюме прямого ответа нет, и в открытых источниках не нашлось надёжных данных.\n\n"
-               f"Свяжитесь со мной напрямую: {settings.contact_info}")
-    await message.answer(txt, reply_markup=main_kb())
+async def cb_resume(c: CallbackQuery):
+    await handle_resume(c.message); await c.answer()
 
-# ========= Callback-хендлеры =========
-async def cb_about(callback: CallbackQuery):
-    await handle_about(callback.message); await callback.answer()
+async def cb_resume_onepage(c: CallbackQuery):
+    await handle_resume_onepage(c.message); await c.answer()
 
-async def cb_resume(callback: CallbackQuery):
-    await handle_resume(callback.message); await callback.answer()
+async def cb_linkedin(c: CallbackQuery):
+    await handle_linkedin(c.message); await c.answer()
 
-async def cb_resume_onepage(callback: CallbackQuery):
-    await handle_resume_onepage(callback.message)
-    with contextlib_sup():
-        await callback.answer()
-
-async def cb_linkedin(callback: CallbackQuery):
-    await handle_linkedin(callback.message); await callback.answer()
-
-async def cb_faq_menu(callback: CallbackQuery):
+async def cb_faq_menu(c: CallbackQuery):
     if not ACTIVE_FAQ_TOPICS:
-        await callback.message.answer("Сейчас нет доступных FAQ по резюме. " + CTA, reply_markup=main_kb())
-        return await callback.answer()
-    await callback.message.answer("Часто задаваемые вопросы от HR — выберите тему (или задайте вопрос текстом):",
-                                  reply_markup=faq_kb(0))
-    await callback.answer()
+        await c.message.answer("Сейчас нет доступных FAQ по резюме. " + CTA, reply_markup=main_kb())
+        return await c.answer()
+    await c.message.answer("Часто задаваемые вопросы от HR — выберите тему:",
+                           reply_markup=faq_kb(0))
+    await c.answer()
 
-async def cb_faq_page(callback: CallbackQuery):
-    try: page = int(callback.data.split(":",1)[1])
+async def cb_faq_page(c: CallbackQuery):
+    try: page = int(c.data.split(":",1)[1])
     except Exception: page = 0
-    try:
-        await callback.message.edit_reply_markup(reply_markup=faq_kb(page))
-    except Exception:
-        await callback.message.answer("Часто задаваемые вопросы от HR — выберите тему:",
-                                      reply_markup=faq_kb(page))
-    await callback.answer()
+    kb = faq_kb(page)
+    with suppress(Exception):
+        await c.message.edit_reply_markup(reply_markup=kb)
+        return await c.answer()
+    await c.message.answer("Часто задаваемые вопросы от HR — выберите тему:", reply_markup=kb)
+    await c.answer()
 
-async def cb_faq_topic(callback: CallbackQuery):
-    key = callback.data.split(":",1)[1]
+async def cb_faq_topic(c: CallbackQuery):
+    key = c.data.split(":",1)[1]
     if key not in FAQ_CACHE:
-        await callback.answer("По этой теме нет ответа в кэше.", show_alert=True); return
+        return await c.answer("По этой теме нет ответа в кэше.", show_alert=True)
     label = next((lbl for k,lbl,_ in ACTIVE_FAQ_TOPICS if k==key), "Ответ")
-    await callback.message.answer(f"{label}:\n\n{FAQ_CACHE[key]}", reply_markup=main_kb())
-    await callback.answer()
+    await c.message.answer(f"{label}:\n\n{FAQ_CACHE[key]}", reply_markup=main_kb())
+    await c.answer()
 
-async def cb_faq_close(callback: CallbackQuery):
-    try: await callback.message.delete()
-    except Exception: pass
-    await callback.answer()
+async def cb_faq_close(c: CallbackQuery):
+    with suppress(Exception):
+        await c.message.delete()
+    await c.answer()
 
-# ========= Startup & run =========
+# ========= Startup =========
+from contextlib import suppress
 async def on_startup():
     load_cache()
-    print("[STARTUP] Cache loaded (no heavy LLM calls).")
+    # Авто-прогрев, если пусто:
+    if not ABOUT_TEXT or not ACTIVE_FAQ_TOPICS:
+        def _run():
+            try:
+                import subprocess
+                subprocess.run([sys.executable, "ingestion.py"], check=True)
+            except Exception:
+                import importlib
+                ingestion = importlib.import_module("ingestion")
+                if hasattr(ingestion, "main"):
+                    ingestion.main()
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _run)
+            load_cache()
+        except Exception as e:
+            print(f"[STARTUP] Auto-ingest skipped: {e}")
+    print(f"[STARTUP] Cache loaded; FAQ ready.")
 
 def register_handlers(dp: Dispatcher):
-    # Команды/сообщения
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_help, Command(commands=["help"]))
     dp.message.register(handle_about, Command(commands=["about"]))
@@ -479,7 +358,6 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(handle_reindex, Command(commands=["reindex"]))
     dp.message.register(handle_free_text, F.text)
 
-    # Кнопки
     dp.callback_query.register(cb_about, F.data == "about")
     dp.callback_query.register(cb_resume, F.data == "resume")
     dp.callback_query.register(cb_resume_onepage, F.data == "resume_1p")
@@ -489,17 +367,16 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(cb_faq_page, lambda c: c.data and c.data.startswith("faq_p:"))
     dp.callback_query.register(cb_faq_topic, lambda c: c.data and c.data.startswith("faq_t:"))
 
-# если этот файл запускается напрямую (локально) — обычный long-polling
-async def main():
+# Локальный запуск (если нужен)
+async def _main():
     if not settings.telegram_token:
         raise RuntimeError("Проверьте TELEGRAM_BOT_TOKEN в .env")
     bot = Bot(token=settings.telegram_token)
     dp = Dispatcher()
     dp.startup.register(on_startup)
     register_handlers(dp)
-
-    print("Бот запущен (long polling). Нажмите Ctrl+C для остановки.")
+    print("Бот запущен (long polling). Ctrl+C для выхода.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_main())
