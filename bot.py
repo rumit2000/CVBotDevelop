@@ -277,7 +277,7 @@ async def ensure_faq_ready():
 def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Обо мне", callback_data="about")
-    kb.button(text="Скачать резюме", callback_data="resume")
+    kb.button(text="СV", callback_data="resume")
     kb.button(text="FAQ от HR", callback_data="faq_menu")  # всегда видна
 
     link = (settings.linkedin_url or "").strip()
