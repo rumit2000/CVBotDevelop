@@ -24,6 +24,19 @@ from lxml import html as lxml_html
 
 from config import settings
 
+# … над блоком обработчиков, ближе к началу файла
+CTA = "Вы также можете задать вопрос на естественном языке."
+
+SHORT_ABOUT = (
+    "Опытный технический лидер с более чем 20-летним стажем в разработке и управлении "
+    "высокотехнологичными продуктами. Специализируюсь на исследованиях и внедрении решений в области "
+    "искусственного интеллекта (AI), включая крупные языковые модели (LLM: GigaChat, GPT, DeepSeek) и AI-агентов. "
+    "Руководил проектами по созданию AI-ассистентов, развертыванию LLM на маломощных платформах (Raspberry Pi, МКС), "
+    "внедрению нейросетей в embedded-устройства и трансформации бизнес-процессов через AI. "
+    "Лауреат премии CES 2022 за инновации."
+)
+
+
 # ========= Глобальные кэши =========
 ABOUT_TEXT: Optional[str] = None
 ACTIVE_FAQ_TOPICS: List[Tuple[str, str, str]] = []  # (key, label, full)
@@ -506,8 +519,9 @@ async def handle_help(message: types.Message):
     await message.answer(txt, reply_markup=main_kb())
 
 async def handle_about(message: types.Message):
-    if ABOUT_TEXT: await message.answer(ABOUT_TEXT, reply_markup=main_kb())
-    else: await message.answer("Кэш ещё не создан. Выполните /reindex.", reply_markup=main_kb())
+    # По кнопке "Обо мне" теперь всегда короткая самопрезентация
+    await message.answer(SHORT_ABOUT, reply_markup=main_kb())
+
 
 async def handle_resume(message: types.Message):
     if not os.path.exists(settings.resume_path):
