@@ -10,26 +10,16 @@ class Settings:
 
     # OpenAI
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "").strip()
-    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip()
+    openai_model: str = (os.getenv("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
+    assistant_id: str = os.getenv("OPENAI_ASSISTANT_ID", "").strip()
 
-    # Assistants API (необязательно)
-    assistant_id: str = os.getenv("ASSISTANT_ID", "").strip()
-
-    # Резюме
+    # Resume / Links
     resume_path: str = os.getenv("RESUME_PATH", "data/CVTimurAsyaev.pdf").strip()
-    # NEW: one-pager путь (по умолчанию data/CVTimurAsyaevOnePage.pdf)
-    resume_onepage_path: str = os.getenv("RESUME_ONEPAGE_PATH", "data/CVTimurAsyaevOnePage.pdf").strip()
-
-    # Ссылки/контакты
     linkedin_url: str = os.getenv("LINKEDIN_URL", "").strip()
-    contact_info: str = os.getenv(
-        "CONTACT_INFO",
-        "Связаться: @TimurAsyaev • rumit2000@gmail.com"
-    ).strip()
+    contact_info: str = os.getenv("CONTACT_INFO", "@TimurAsyaev • rumit2000@gmail.com").strip()
 
-def build_settings() -> Settings:
-    return Settings()
+    # (для совместимости — не используются в long-polling)
+    base_webhook_url: str = os.getenv("BASE_WEBHOOK_URL", "").strip()
+    webhook_secret: str = os.getenv("WEBHOOK_SECRET", "").strip()
 
-settings = build_settings()
-
+settings = Settings()
