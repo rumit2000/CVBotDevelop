@@ -274,22 +274,32 @@ async def ensure_faq_ready():
         ACTIVE_FAQ_TOPICS, FAQ_CACHE = [], {}
 
 # ========= Кнопочные клавиатуры =========
+#def main_kb() -> InlineKeyboardMarkup:
+#    kb = InlineKeyboardBuilder()
+#    kb.button(text="Обо мне", callback_data="about")
+#    kb.button(text="СV", callback_data="resume")
+#    kb.button(text="FAQ от HR", callback_data="faq_menu")  # всегда видна##
+#
+#    link = (settings.linkedin_url or "").strip()
+#    if link:
+#        if not link.startswith(("http://", "https://")):
+#            link = "https://" + link
+#        kb.button(text="LinkedIn", url=link)
+#    else:
+#        kb.button(text="LinkedIn", callback_data="linkedin")
+#
+#    kb.adjust(2, 2)
+#    return kb.as_markup()
+
 def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Обо мне", callback_data="about")
-    kb.button(text="СV", callback_data="resume")
-    kb.button(text="FAQ от HR", callback_data="faq_menu")  # всегда видна
-
-    link = (settings.linkedin_url or "").strip()
-    if link:
-        if not link.startswith(("http://", "https://")):
-            link = "https://" + link
-        kb.button(text="LinkedIn", url=link)
-    else:
-        kb.button(text="LinkedIn", callback_data="linkedin")
-
+    kb.button(text="CV", callback_data="resume")
+    kb.button(text="FAQ от HR", callback_data="faq_menu")
+    kb.button(text="CV OnePage", callback_data="onepage")
     kb.adjust(2, 2)
     return kb.as_markup()
+
 
 def faq_kb(page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
     topics = ACTIVE_FAQ_TOPICS
@@ -502,6 +512,21 @@ async def answer_via_assistant(question: str) -> Optional[str]:
         return None
 
 # ========= Callback-хендлеры и команды =========
+async def handle_onepage(message: types.Message):
+    onepage_path = "data/CVTimurAsyaevOnePage.pdf"
+    if not os.path.exists(onepage_path):
+        await message.answer("Файл one-page резюме не найден на сервере.")
+        return
+    await message.answer_document(
+        FSInputFile(onepage_path, filename="CVTimurAsyaevOnePage.pdf"),
+        caption="One-page CV Тимура Асяева (PDF).\n\n" + CTA
+    )
+
+async def cb_onepage(callback: CallbackQuery):
+    await handle_onepage(callback.message)
+    with contextlib_sup():
+        await callback.answer()
+
 async def handle_start(message: types.Message):
     if ABOUT_TEXT:
         intro = "Вы общаетесь с цифровым аватаром резюме Тимура Асяева.\n\n"
@@ -677,15 +702,23 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(handle_help, Command(commands=["help"]))
     dp.message.register(handle_about, Command(commands=["about"]))
     dp.message.register(handle_resume, Command(commands=["resume"]))
-    dp.message.register(handle_linkedin, Command(commands=["linkedin"]))
+    #dp.message.register(handle_linkedin, Command(commands=["linkedin"]))
     dp.message.register(handle_reindex, Command(commands=["reindex"]))
     dp.message.register(handle_free_text, F.text)
 
     # Кнопки (callbacks)
     dp.callback_query.register(cb_about, F.data == "about")
     dp.callback_query.register(cb_resume, F.data == "resume")
-    dp.callback_query.register(cb_linkedin, F.data == "linkedin")
+    #dp.callback_query.register(cb_linkedin, F.data == "linkedin")
     dp.callback_query.register(cb_faq_menu, F.data == "faq_menu")
     dp.callback_query.register(cb_faq_close, F.data == "faq_close")
     dp.callback_query.register(cb_faq_page, lambda c: c.data and c.data.startswith("faq_p:"))
     dp.callback_query.register(cb_faq_topic, lambda c: c.data and c.data.startswith("faq_t:"))
+
+
+        # команды (по желанию можно и команду, но не обязательно):
+    # dp.message.register(handle_onepage, Command(commands=["onepage"]))
+
+    # callbacks:
+    dp.callback_query.register(cb_onepage, F.data == "onepage")
+
