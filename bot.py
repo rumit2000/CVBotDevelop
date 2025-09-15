@@ -1,8 +1,12 @@
 
 # bot.py
-# Кнопки (Обо мне / Скачать полное резюме / Скачать OnePageCV / FAQ от HR / LinkedIn)
-# FAQ показывается, только если в кэше есть темы. На старте при отсутствии кэша — бот сам
-# пытется прогреть его через ingestion и перезагружает.
+# Кнопки:
+#  - "Обо мне"
+#  - "CV" (полное резюме)
+#  - "CVOnePage" (one-pager)
+#  - "FAQ от HR" (всегда показываем; если тем нет — пишем, что пусто)
+#
+# Остальной функционал — без изменений.
 
 import asyncio
 import os
@@ -29,6 +33,16 @@ ACTIVE_FAQ_TOPICS: List[Tuple[str, str, str]] = []
 FAQ_CACHE: Dict[str, str] = {}
 
 CTA = "Вы также можете задать вопрос на естественном языке."
+
+# Fallback-текст «Обо мне», если кэш не подхватился
+ABOUT_FALLBACK = (
+    "Опытный технический лидер с более чем 20-летним стажем в разработке и управлении "
+    "высокотехнологичными продуктами. Специализируюсь на исследованиях и внедрении решений в "
+    "области искусственного интеллекта (AI), включая крупные языковые модели (LLM: GigaChat, GPT, "
+    "DeepSeek) и AI-агентов. Руководил проектами по созданию AI-ассистентов, развертыванию LLM на "
+    "маломощных платформах (Raspberry Pi, МКС), внедрению нейросетей в embedded-устройства и "
+    "трансформации бизнес-процессов через AI. Лауреат премии CES 2022 за инновации."
+)
 
 # ========= Эвристики =========
 EMPTY_PATTERNS = [
@@ -83,14 +97,9 @@ def load_cache():
 def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Обо мне", callback_data="about")
-    kb.button(text="Скачать полное резюме", callback_data="resume")
-    kb.button(text="Скачать OnePageCV", callback_data="resume_1p")
-    if ACTIVE_FAQ_TOPICS:
-        kb.button(text="FAQ от HR", callback_data="faq_menu")
-    if settings.linkedin_url:
-        kb.button(text="LinkedIn", url=settings.linkedin_url)
-    else:
-        kb.button(text="LinkedIn", callback_data="linkedin")
+    kb.button(text="CV", callback_data="resume")
+    kb.button(text="CVOnePage", callback_data="resume_1p")
+    kb.button(text="FAQ от HR", callback_data="faq_menu")  # всегда показываем
     kb.adjust(2, 2)
     return kb.as_markup()
 
@@ -115,10 +124,6 @@ def faq_kb(page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 # ========= Веб-поиск/загрузка =========
-from ddgs import DDGS
-import httpx
-from lxml import html as lxml_html
-
 def _web_search_impl(query: str, max_results: int = 5):
     out = []
     try:
@@ -149,7 +154,6 @@ def _web_fetch_impl(url: str, max_chars: int = 4000):
             resp.raise_for_status()
             if any(part in resp.url.lower() for part in BAD_URL_PARTS):
                 return {"url": url, "text": ""}
-            from lxml import html as lxml_html
             doc = lxml_html.fromstring(resp.text)
             for bad in doc.xpath('//script|//style|//noscript'):
                 bad.drop_tree()
@@ -159,7 +163,6 @@ def _web_fetch_impl(url: str, max_chars: int = 4000):
         return {"url": url, "text": ""}
 
 # ========= Assistants API =========
-from openai import OpenAI
 async def answer_via_assistant(question: str) -> Optional[str]:
     if not settings.assistant_id:
         return None
@@ -212,11 +215,10 @@ async def answer_via_assistant(question: str) -> Optional[str]:
 
 # ========= Обработчики =========
 async def handle_start(message: types.Message):
-    if ABOUT_TEXT:
-        intro = "Вы общаетесь с цифровым аватаром резюме Тимура Асяева.\n\n"
-        await message.answer(intro + ABOUT_TEXT, reply_markup=main_kb())
-    else:
-        await message.answer("Кэш ещё не создан. Выполните /reindex или `python3 ingestion.py`.", reply_markup=main_kb())
+    # Если есть кэш — показываем из него. Если нет — используем fallback.
+    about_text = ABOUT_TEXT or ABOUT_FALLBACK
+    intro = "Вы общаетесь с цифровым аватаром резюме Тимура Асяева.\n\n"
+    await message.answer(intro + about_text, reply_markup=main_kb())
 
 async def handle_help(message: types.Message):
     txt = ("Команды:\n"
@@ -228,8 +230,7 @@ async def handle_help(message: types.Message):
     await message.answer(txt, reply_markup=main_kb())
 
 async def handle_about(message: types.Message):
-    if ABOUT_TEXT: await message.answer(ABOUT_TEXT, reply_markup=main_kb())
-    else: await message.answer("Кэш ещё не создан. Выполните /reindex.", reply_markup=main_kb())
+    await message.answer(ABOUT_TEXT or ABOUT_FALLBACK, reply_markup=main_kb())
 
 async def handle_resume(message: types.Message):
     if not os.path.exists(settings.resume_path):
@@ -249,6 +250,7 @@ async def handle_resume_onepage(message: types.Message):
     )
 
 async def handle_linkedin(message: types.Message):
+    # Кнопки LinkedIn в меню больше нет, но команду /linkedin оставим на всякий случай.
     if settings.linkedin_url:
         await message.answer(f"Мой LinkedIn: {settings.linkedin_url}\n\n{CTA}", reply_markup=main_kb())
     else:
@@ -260,7 +262,6 @@ async def handle_reindex(message: types.Message):
     await message.answer("Начинаю переиндексацию…")
     try:
         def _run():
-            # Надёжный вызов: сначала subprocess, потом импортом
             try:
                 import subprocess
                 subprocess.run([sys.executable, "ingestion.py"], check=True)
@@ -307,10 +308,10 @@ async def cb_faq_page(c: CallbackQuery):
     try: page = int(c.data.split(":",1)[1])
     except Exception: page = 0
     kb = faq_kb(page)
-    with suppress(Exception):
+    try:
         await c.message.edit_reply_markup(reply_markup=kb)
-        return await c.answer()
-    await c.message.answer("Часто задаваемые вопросы от HR — выберите тему:", reply_markup=kb)
+    except Exception:
+        await c.message.answer("Часто задаваемые вопросы от HR — выберите тему:", reply_markup=kb)
     await c.answer()
 
 async def cb_faq_topic(c: CallbackQuery):
@@ -322,12 +323,11 @@ async def cb_faq_topic(c: CallbackQuery):
     await c.answer()
 
 async def cb_faq_close(c: CallbackQuery):
-    with suppress(Exception):
-        await c.message.delete()
+    try: await c.message.delete()
+    except Exception: pass
     await c.answer()
 
 # ========= Startup =========
-from contextlib import suppress
 async def on_startup():
     load_cache()
     # Авто-прогрев, если пусто:
@@ -361,7 +361,6 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(cb_about, F.data == "about")
     dp.callback_query.register(cb_resume, F.data == "resume")
     dp.callback_query.register(cb_resume_onepage, F.data == "resume_1p")
-    dp.callback_query.register(cb_linkedin, F.data == "linkedin")
     dp.callback_query.register(cb_faq_menu, F.data == "faq_menu")
     dp.callback_query.register(cb_faq_close, F.data == "faq_close")
     dp.callback_query.register(cb_faq_page, lambda c: c.data and c.data.startswith("faq_p:"))
