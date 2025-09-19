@@ -274,22 +274,7 @@ async def ensure_faq_ready():
         ACTIVE_FAQ_TOPICS, FAQ_CACHE = [], {}
 
 # ========= Кнопочные клавиатуры =========
-#def main_kb() -> InlineKeyboardMarkup:
-#    kb = InlineKeyboardBuilder()
-#    kb.button(text="Обо мне", callback_data="about")
-#    kb.button(text="СV", callback_data="resume")
-#    kb.button(text="FAQ от HR", callback_data="faq_menu")  # всегда видна##
-#
-#    link = (settings.linkedin_url or "").strip()
-#    if link:
-#        if not link.startswith(("http://", "https://")):
-#            link = "https://" + link
-#        kb.button(text="LinkedIn", url=link)
-#    else:
-#        kb.button(text="LinkedIn", callback_data="linkedin")
-#
-#    kb.adjust(2, 2)
-#    return kb.as_markup()
+
 
 def main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -298,6 +283,17 @@ def main_kb() -> InlineKeyboardMarkup:
     kb.button(text="FAQ от HR", callback_data="faq_menu")
     kb.button(text="CV OnePage", callback_data="onepage")
     kb.adjust(2, 2)
+    return kb.as_markup()
+
+def main_kb_with_video() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Обо мне", callback_data="about")
+    kb.button(text="CV", callback_data="resume")
+    kb.button(text="FAQ от HR", callback_data="faq_menu")
+    kb.button(text="CV OnePage", callback_data="onepage")
+    # дополнительная кнопка «ничего не делает» (обработчик добавим позже)
+    kb.button(text="видео ответ", callback_data="video_nop")
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -592,7 +588,13 @@ async def handle_free_text(message: types.Message):
 
     ans = await answer_via_assistant(question)
     if ans and not is_empty_message(ans):
-        await message.answer(ans, reply_markup=main_kb())
+        # если ассистент вернул «вне тематики» — кнопки «видео ответ» не добавляем
+        not_relevant_msg = (
+            "Этот вопрос не относится к тематике собеседования и моему резюме. "
+            f"По организационным или личным вопросам лучше связаться со мной: {settings.contact_info}"
+        )
+        markup = main_kb() if ans.strip() == not_relevant_msg else main_kb_with_video()
+        await message.answer(ans, reply_markup=markup)
         return
 
     links = []
