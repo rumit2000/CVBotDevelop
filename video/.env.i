@@ -1,0 +1,1 @@
+DID_API_KEY=cnVtaXQyMDAwQGdtYWlsLmNvbQ:7L4cKz4YJ5IEHDRk-qY5n  # вставьте сюда ключ ровно в таком виде
