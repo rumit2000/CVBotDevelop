@@ -7,49 +7,97 @@ talk_maker.py — минималистичный генератор видео-�
  - Импорт из кода: make_talk_video(text, image="avatar.png", out="out.mp4")
 
 Ожидает:
- - переменная окружения DID_API_KEY (или DID_API_USERNAME/DID_API_PASSWORD как base auth)
- - локальный файл avatar.png в корне (или source_url прямо на картинку)
+ - переменная окружения DID_API_KEY (или DID_API_USERNAME/DID_API_PASSWORD для basic)
+ - локальный файл avatar.png в корне (или HTTPS-ссылка в DID_SOURCE_URL / явный source_url)
 
-Примечание: этот файл не тянет .env сам — рендер окружения делает Render.
+Если тариф D-ID не принимает source_url=data:..., положите картинку на HTTPS
+и укажите переменную окружения DID_SOURCE_URL=https://.../avatar.png
 """
 
 import os
-import sys
 import time
-import json
 import argparse
 import pathlib
 from typing import Optional, Tuple
 
 import httpx
 
-API_BASE = "https://api.d-id.com/v1"  # public REST
-DEFAULT_VOICE = "ru-RU-DmitryNeural"  # дефолт синтез
+API_BASE = "https://api.d-id.com/v1"
+DEFAULT_VOICE = "ru-RU-DmitryNeural"
 
 # ====== Вспомогательные ======
 def _sanitize_line(x: str) -> str:
     return (x or "").strip().replace("\r", "").replace("\n", "")
 
-def _auth_headers(raw_key: str) -> dict:
-    # D-ID поддерживает api-key в заголовке Authorization: Basic <base64> или bearer;
-    # в practice: "Authorization": f"Basic {base64_user_pass}" или "Bearer <token>".
-    # Здесь используем простой вариант X-API-KEY, который их public SDK также принимает.
-    return {"Authorization": f"Bearer {raw_key}", "Content-Type": "application/json"}
+def _abs(p: str) -> str:
+    return str(pathlib.Path(p).absolute())
 
+# ====== Авторизация ======
 def get_key_from_env_or_fail() -> str:
+    """
+    Возвращает сырой ключ/токен для D-ID:
+    - DID_API_KEY (рекомендуется)
+    - или пара DID_API_USERNAME + DID_API_PASSWORD (будет использован как Basic)
+    """
     k = _sanitize_line(os.getenv("DID_API_KEY", ""))
     if k:
         return k
-    # Fallback на пару username/password (если используется Basic)
     user = _sanitize_line(os.getenv("DID_API_USERNAME", ""))
     pwd  = _sanitize_line(os.getenv("DID_API_PASSWORD", ""))
     if user and pwd:
         import base64
-        return "Basic " + base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("utf-8")
-    raise RuntimeError("DID_API_KEY не задан в окружении")
+        # вернём уже base64, чтобы _auth_headers мог подставить как Basic <base64>
+        return base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("utf-8")
+    raise RuntimeError("DID_API_KEY не задан в окружении (или укажите DID_API_USERNAME/DID_API_PASSWORD)")
 
-def _abs(p: str) -> str:
-    return str(pathlib.Path(p).absolute())
+def _auth_headers(raw_key: str, mode: str = "bearer") -> dict:
+    """
+    Возвращает заголовки авторизации для D-ID.
+    Поддерживаемые режимы: bearer | basic | xapikey
+    """
+    h = {"Content-Type": "application/json"}
+    k = (raw_key or "").strip()
+    if not k:
+        return h
+    if mode == "bearer":
+        # Authorization: Bearer <token>
+        h["Authorization"] = f"Bearer {k}"
+    elif mode == "basic":
+        # Authorization: Basic <base64(user:pass)> или Basic <api-key> (на некоторых аккаунтах)
+        h["Authorization"] = f"Basic {k}"
+    else:
+        # X-API-KEY: <token>
+        h["X-API-KEY"] = k
+    return h
+
+def _request_json(method: str, url: str, json_body, raw_key: str):
+    """
+    Делает запрос к D-ID, пробуя несколько вариантов авторизации:
+    1) Bearer
+    2) Basic
+    3) X-API-KEY
+    Если 401/403 — пробуем следующий способ. Иначе — поднимаем исключение при ошибке.
+    """
+    modes = ["bearer", "basic", "xapikey"]
+    last_exc = None
+    for m in modes:
+        try:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+                r = c.request(method, url, headers=_auth_headers(raw_key, m), json=json_body)
+                if r.status_code in (401, 403):
+                    # пробуем другой тип авторизации
+                    continue
+                r.raise_for_status()
+                if r.content and r.headers.get("Content-Type", "").lower().startswith("application/json"):
+                    return r.json()
+                # не JSON — вернём как текст
+                return {"raw": r.text}
+        except Exception as e:
+            last_exc = e
+    # все способы не сработали
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Authorization to D-ID failed")
 
 # ====== API вызовы ======
 def create_talk(raw_key: str, source_url: str, text: str, voice: str = DEFAULT_VOICE, stitch: bool = True) -> str:
@@ -65,21 +113,15 @@ def create_talk(raw_key: str, source_url: str, text: str, voice: str = DEFAULT_V
         },
         "stitch": stitch
     }
-    headers = _auth_headers(raw_key)
-    with httpx.Client(timeout=30.0) as c:
-        r = c.post(f"{API_BASE}/talks", headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data["id"]
+    data = _request_json("POST", f"{API_BASE}/talks", payload, raw_key)
+    if "id" not in data:
+        raise RuntimeError(f"Unexpected D-ID response: {data}")
+    return data["id"]
 
 def get_talk(raw_key: str, talk_id: str) -> dict:
-    headers = _auth_headers(raw_key)
-    with httpx.Client(timeout=30.0) as c:
-        r = c.get(f"{API_BASE}/talks/{talk_id}", headers=headers)
-        r.raise_for_status()
-        return r.json()
+    return _request_json("GET", f"{API_BASE}/talks/{talk_id}", None, raw_key)
 
-def wait_until_ready(raw_key: str, talk_id: str, timeout: float = 120.0, interval: float = 2.0) -> Tuple[str, dict]:
+def wait_until_ready(raw_key: str, talk_id: str, timeout: float = 180.0, interval: float = 2.0) -> Tuple[str, dict]:
     """
     Дождаться готовности, вернуть (result_url, full_json).
     """
@@ -88,16 +130,25 @@ def wait_until_ready(raw_key: str, talk_id: str, timeout: float = 120.0, interva
     while True:
         info = get_talk(raw_key, talk_id)
         last = info
-        status = info.get("status")
+        status = (info.get("status") or "").lower()
         if status == "done":
             result_url = info.get("result_url") or (info.get("result", {}) or {}).get("url")
             if not result_url:
                 raise RuntimeError("result_url отсутствует в ответе D-ID")
             return result_url, info
         if status in ("error", "failed"):
-            raise RuntimeError(f"D-ID error: {info}")
+            # Частый кейс: некоторые тарифы запрещают source_url=data:...
+            err = (info.get("error") or info.get("message") or str(info) or "").strip()
+            hint = ""
+            if "source_url" in err.lower():
+                hint = (
+                    "\nПодсказка: Ваш тариф D-ID может не принимать source_url как data: URL. "
+                    "Загрузите avatar.png на доступный по HTTPS хост (S3/статик Render) и "
+                    "установите переменную окружения DID_SOURCE_URL=https://.../avatar.png."
+                )
+            raise RuntimeError(f"D-ID error: {err}{hint}")
         if time.time() - start > timeout:
-            raise TimeoutError(f"Ожидание результата превысило {timeout} секунд")
+            raise TimeoutError(f"Ожидание результата превысило {timeout} секунд. Последний статус: {last}")
         time.sleep(interval)
 
 def download_file(url: str, out_path: str) -> str:
@@ -113,8 +164,7 @@ def download_file(url: str, out_path: str) -> str:
 # ====== Источники (аватар) ======
 def file_to_data_url(path: str) -> str:
     """
-    Простой data-url для картинок. Некоторые тарифы D-ID разрешают source_url=data:...
-    Если тариф не поддерживает — нужно загрузить файл на внешний статиκ (S3/Render static) и передавать ссылку.
+    Простой data: URL для картинки. Если тариф не поддерживает — используйте DID_SOURCE_URL.
     """
     import base64
     abspath = _abs(path)
@@ -122,7 +172,6 @@ def file_to_data_url(path: str) -> str:
         raise FileNotFoundError(f"Avatar not found: {abspath}")
     with open(abspath, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("ascii")
-    # попробуем image/png; можно заменить, если у вас другой формат
     return f"data:image/png;base64,{b64}"
 
 # ====== Публичная функция для использования из бота ======
@@ -138,16 +187,23 @@ def make_talk_video(text: str,
     """
     if not text or not text.strip():
         raise ValueError("Пустой текст для озвучки")
+
     raw_key = raw_key or get_key_from_env_or_fail()
 
-    source_url = file_to_data_url(image)  # data: URL, чтобы не заморачиваться с внешним хостингом
+    # Если задан DID_SOURCE_URL — используем его. Иначе попробуем data: из локального файла.
+    env_src = _sanitize_line(os.getenv("DID_SOURCE_URL", ""))
+    if env_src:
+        source_url = env_src
+    else:
+        source_url = file_to_data_url(image)
+
     voice_id = (voice or DEFAULT_VOICE)
 
     talk_id = create_talk(raw_key, source_url, text.strip(), voice=voice_id, stitch=stitch)
 
     # имя файла по умолчанию — из первых символов текста
-    out_file = out or ("".join(ch for ch in text[:40] if ch.isalnum() or ch in (" ", "_", "-"))
-                       .strip().replace(" ", "_") or "talk") + ".mp4"
+    safe_head = "".join(ch for ch in text[:40] if ch.isalnum() or ch in (" ", "_", "-")).strip().replace(" ", "_")
+    out_file = out or (safe_head or "talk") + ".mp4"
     out_path = _abs(out_file)
 
     result_url, _info = wait_until_ready(raw_key, talk_id, timeout=180.0, interval=2.0)
