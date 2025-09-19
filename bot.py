@@ -4,7 +4,7 @@
 # - FAQ: свой каталог тем, на старте ответы буферизуются из резюме (локальный RAG)
 # - свободные вопросы: OpenAI Assistants API (File Search) + кастомные tools web_search/web_fetch
 # - если ассистент не справился — общий веб-фолбэк или контакты
-# - доп.кнопка "видео ответ" у GPT-ответов: по клику шлём краткое саммари этого ответа
+# - доп.кнопка "видео ответ" у GPT-ответов: по клику генерируем видео-саммари (D-ID) и присылаем MP4
 
 import asyncio
 import os
@@ -24,6 +24,9 @@ import httpx
 from lxml import html as lxml_html
 
 from config import settings
+
+# NEW: генератор видео-ответов
+import talk_maker
 
 # ========= Текстовые константы =========
 CTA = "Вы также можете задать вопрос на естественном языке."
@@ -439,12 +442,11 @@ async def answer_via_assistant(question: str) -> Optional[str]:
     except Exception:
         return None
 
-# ========= Саммари по кнопке «видео ответ» =========
+# ========= Саммари для видео =========
 async def summarize_answer_text(text: str) -> Optional[str]:
     raw = (text or "").strip()
     if not raw:
         return None
-    # убираем html-теги, чтобы не попадали в промпт
     plain = re.sub(r"<[^>]+>", "", raw)
     try:
         client = OpenAI(api_key=settings.openai_api_key)
@@ -637,17 +639,42 @@ async def cb_onepage(callback: CallbackQuery):
     await handle_onepage(callback.message)
     with contextlib_sup(): await callback.answer()
 
-# === Новое: саммари по кнопке «видео ответ» ===
+# === Новое: видео-саммари по кнопке «видео ответ» ===
 async def cb_video_summary(callback: CallbackQuery):
     # берём текст из того сообщения, к которому прикреплена кнопка
     src = getattr(callback.message, "html_text", None) or (callback.message.text or "")
     summary = await summarize_answer_text(src)
-    if summary:
-        await callback.message.answer("Краткий итог ответа:\n\n" + summary, reply_markup=main_kb())
-    else:
+
+    if not summary:
         await callback.message.answer("Не удалось построить краткий итог ответа.", reply_markup=main_kb())
-    with contextlib_sup():
-        await callback.answer()
+        with contextlib_sup(): await callback.answer()
+        return
+
+    info_msg = await callback.message.answer("Готовлю видео-ответ…")
+
+    loop = asyncio.get_running_loop()
+    out_name = f"video_summary_{callback.message.message_id}.mp4"
+
+    def _make():
+        # avatar.png должен лежать в корне репозитория
+        # DID_API_KEY читается из переменных окружения на Render
+        return talk_maker.make_talk_video(summary, image="avatar.png", out=out_name)
+
+    try:
+        saved_path = await loop.run_in_executor(None, _make)
+        await callback.message.answer_video(
+            FSInputFile(saved_path),
+            caption="Видео-ответ (саммари).",
+            reply_markup=main_kb(),
+        )
+    except Exception as e:
+        await callback.message.answer(f"Не удалось собрать видео-ответ: {e}", reply_markup=main_kb())
+    finally:
+        with contextlib_sup(): await info_msg.delete()
+        with contextlib_sup(): await callback.answer()
+        with contextlib_sup():
+            if 'saved_path' in locals() and os.path.exists(saved_path):
+                os.remove(saved_path)
 
 # ========= Startup & registration =========
 async def on_startup():
