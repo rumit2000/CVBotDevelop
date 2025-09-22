@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-talk_maker.py — генератор видео-речи через D-ID API (Talks).
+talk_maker.py — генератор видео-речи через D-ID Talks API.
 
-Запуск:
+Как использовать:
   CLI:  python talk_maker.py -t "Привет!"
-  Код:  make_talk_video("Привет!", image="avatar.png", out="talk.mp4")
+  Импорт: make_talk_video("Привет!", image="avatar.png", out="talk.mp4")
 
-Ожидает:
+ENV:
   DID_API_KEY="API_USERNAME:API_PASSWORD"
-  (или отдельно DID_API_USERNAME и DID_API_PASSWORD)
+    ИЛИ
+  DID_API_USERNAME=API_USERNAME
+  DID_API_PASSWORD=API_PASSWORD
 
-Аватар:
-  по умолчанию data:URL из локального avatar.png,
-  если тариф не принимает data:, задайте DID_SOURCE_URL=https://.../avatar.png
+Если тариф не принимает data:-аватар:
+  DID_SOURCE_URL=https://.../avatar.png
 """
 
 import os
@@ -25,7 +26,8 @@ from typing import Optional, Tuple
 
 import httpx
 
-API_BASE = "https://api.d-id.com/v1"
+# Важно: без /v1 — по текущей доке эндпоинт /talks
+API_BASE = "https://api.d-id.com"
 DEFAULT_VOICE = "ru-RU-DmitryNeural"
 
 # ====== Утилиты ======
@@ -39,10 +41,11 @@ def _headers_common() -> dict:
     return {
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": "cvbotdevelop/1.0 (+https://github.com/rumit2000/CVBotDevelop)"
     }
 
-# ====== Авторизация (ТОЛЬКО Basic USER:PASS) ======
-def get_basic_pair_or_fail() -> str:
+# ====== Авторизация (Basic USER:PASS) ======
+def get_basic_user_pass_or_fail() -> str:
     """
     Возвращает 'USER:PASS' для заголовка Authorization: Basic USER:PASS.
     Берём из:
@@ -62,45 +65,68 @@ def get_basic_pair_or_fail() -> str:
                 "DID_API_KEY должен быть вида 'USER:PASS', либо задайте DID_API_USERNAME и DID_API_PASSWORD."
             )
         user_pass = f"{user}:{pwd}"
+
     # простая валидация
     if ":" not in user_pass or not user_pass.split(":", 1)[0] or not user_pass.split(":", 1)[1]:
         raise RuntimeError("Некорректная пара USER:PASS для D-ID (проверьте переменные окружения).")
     return user_pass
 
-def _auth_headers_basic(user_pass: str) -> dict:
-    """
-    D-ID доки показывают формат Authorization: Basic API_USERNAME:API_PASSWORD (без base64).
-    Поэтому кладём пару как есть. (Если ваш аккаунт ожидает base64 — раскомментируйте блок ниже.)
-    """
-    h = _headers_common()
+def _headers_basic_literal(user_pass: str) -> dict:
+    """D-ID дока: Authorization: Basic API_USERNAME:API_PASSWORD (без base64)."""
+    h = _headers_common().copy()
     h["Authorization"] = f"Basic {user_pass}"
+    return h
 
-    # --- вариант на случай редких аккаунтов, где нужен классический Basic с base64:
-    # u, p = user_pass.split(":", 1)
-    # token = base64.b64encode(f"{u}:{p}".encode("utf-8")).decode("ascii")
-    # h["Authorization"] = f"Basic {token}"
+def _headers_basic_b64(user_pass: str) -> dict:
+    """Фолбэк: классический Basic по RFC (base64(user:pass)), на случай редких аккаунтов."""
+    h = _headers_common().copy()
+    token = base64.b64encode(user_pass.encode("utf-8")).decode("ascii")
+    h["Authorization"] = f"Basic {token}"
     return h
 
 def _request_json(method: str, url: str, json_body, user_pass: str):
     """
-    Один способ — Basic USER:PASS. Если вернулся 401/403, поднимем понятную ошибку.
+    Пробуем 2 режима авторизации по очереди:
+      1) Basic USER:PASS  (как в доке D-ID)
+      2) Basic base64(USER:PASS)  (фолбэк)
+    Если 401/403 — собираем максимально понятное сообщение.
     """
-    headers = _auth_headers_basic(user_pass)
-    with httpx.Client(timeout=30.0, follow_redirects=True) as c:
-        r = c.request(method, url, headers=headers, json=json_body)
-        ct = (r.headers.get("Content-Type") or "").lower()
-        if r.status_code in (401, 403):
-            # максимально полный текст от сервера
-            try:
-                data = r.json()
-                msg = (data.get("message") or data.get("error") or str(data)).strip()
-            except Exception:
-                msg = r.text
-            raise RuntimeError(f"Авторизация в D-ID не прошла: {msg} (HTTP {r.status_code})")
-        r.raise_for_status()
-        if ct.startswith("application/json"):
-            return r.json()
-        return {"raw": r.text}
+    variants = [
+        ("basic_literal", _headers_basic_literal(user_pass)),
+        ("basic_b64",     _headers_basic_b64(user_pass)),
+    ]
+
+    last_status = None
+    last_text = None
+
+    for name, headers in variants:
+        try:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+                r = c.request(method, url, headers=headers, json=json_body)
+                last_status = r.status_code
+                ct = (r.headers.get("Content-Type") or "").lower()
+                last_text = r.text
+
+                if r.status_code in (401, 403):
+                    # попробуем следующий режим; если это последний — сбросим осмысленную ошибку ниже
+                    continue
+
+                r.raise_for_status()
+                if ct.startswith("application/json"):
+                    return r.json()
+                return {"raw": r.text}
+        except Exception as e:
+            last_text = f"{type(e).__name__}: {e}"
+            continue
+
+    hint = ""
+    if last_status in (401, 403):
+        hint = (
+            "\nПроверьте, что DID_API_KEY задан как 'USER:PASS' "
+            "или заданы DID_API_USERNAME/DID_API_PASSWORD. "
+            "Также убедитесь, что запрос идёт на https://api.d-id.com/talks."
+        )
+    raise RuntimeError(f"Авторизация в D-ID не прошла (HTTP {last_status}): {last_text}{hint}")
 
 # ====== API ======
 def create_talk(user_pass: str, source_url: str, text: str, voice: str = DEFAULT_VOICE, stitch: bool = True) -> str:
@@ -138,8 +164,8 @@ def wait_until_ready(user_pass: str, talk_id: str, timeout: float = 180.0, inter
             hint = ""
             if "source_url" in err.lower():
                 hint = (
-                    "\nПодсказка: ваш тариф D-ID может не принимать source_url как data: URL. "
-                    "Загрузите avatar.png на публичный HTTPS и установите "
+                    "\nПодсказка: тариф может не принимать source_url как data: URL. "
+                    "Загрузите avatar.png на публичный HTTPS и задайте "
                     "DID_SOURCE_URL=https://.../avatar.png."
                 )
             raise RuntimeError(f"D-ID error: {err}{hint}")
@@ -173,20 +199,17 @@ def make_talk_video(text: str,
                     voice: Optional[str] = None,
                     stitch: bool = True) -> str:
     """
-    Синхронно делает ролик с озвучкой текста и возвращает путь к mp4.
+    Делает ролик с озвучкой текста и возвращает путь к mp4.
     Используется из Telegram-бота (импортом модуля).
     """
     if not text or not text.strip():
         raise ValueError("Пустой текст для озвучки")
 
-    user_pass = get_basic_pair_or_fail()
+    user_pass = get_basic_user_pass_or_fail()
 
     # Если задан DID_SOURCE_URL — используем его. Иначе data: из файла.
     env_src = _sanitize(os.getenv("DID_SOURCE_URL", ""))
-    if env_src:
-        source_url = env_src
-    else:
-        source_url = file_to_data_url(image)
+    source_url = env_src if env_src else file_to_data_url(image)
 
     voice_id = (voice or DEFAULT_VOICE)
 
