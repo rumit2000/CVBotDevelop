@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-talk_maker.py — генератор видео-речи через D-ID API.
+talk_maker.py — генератор видео-речи через D-ID API (Talks).
 
 Запуск:
   CLI:  python talk_maker.py -t "Привет!"
   Код:  make_talk_video("Привет!", image="avatar.png", out="talk.mp4")
 
 Ожидает:
-  DID_API_KEY  (или DID_API_USERNAME/DID_API_PASSWORD для basic)
-  avatar.png в корне ИЛИ DID_SOURCE_URL=https://.../avatar.png
+  DID_API_KEY="API_USERNAME:API_PASSWORD"
+  (или отдельно DID_API_USERNAME и DID_API_PASSWORD)
 
-ENV (опционально):
-  DID_AUTH_MODE=basic|xapikey|bearer   # зафиксировать режим авторизации
+Аватар:
+  по умолчанию data:URL из локального avatar.png,
+  если тариф не принимает data:, задайте DID_SOURCE_URL=https://.../avatar.png
 """
 
 import os
@@ -40,80 +41,69 @@ def _headers_common() -> dict:
         "Accept": "application/json",
     }
 
-# ====== Авторизация ======
-def get_key_from_env_or_fail() -> str:
-    k = _sanitize(os.getenv("DID_API_KEY", ""))
-    if k:
-        return k
-    user = _sanitize(os.getenv("DID_API_USERNAME", ""))
-    pwd  = _sanitize(os.getenv("DID_API_PASSWORD", ""))
-    if user and pwd:
-        return base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("utf-8")
-    raise RuntimeError("DID_API_KEY не задан (или укажите DID_API_USERNAME/DID_API_PASSWORD)")
+# ====== Авторизация (ТОЛЬКО Basic USER:PASS) ======
+def get_basic_pair_or_fail() -> str:
+    """
+    Возвращает 'USER:PASS' для заголовка Authorization: Basic USER:PASS.
+    Берём из:
+      - DID_API_KEY, если там есть двоеточие;
+      - иначе из пары DID_API_USERNAME + DID_API_PASSWORD.
+    """
+    raw = _sanitize(os.getenv("DID_API_KEY", ""))
+    if raw.lower().startswith("basic "):
+        raw = raw[6:].strip()
+    if ":" in raw:
+        user_pass = raw
+    else:
+        user = _sanitize(os.getenv("DID_API_USERNAME", ""))
+        pwd  = _sanitize(os.getenv("DID_API_PASSWORD", ""))
+        if not (user and pwd):
+            raise RuntimeError(
+                "DID_API_KEY должен быть вида 'USER:PASS', либо задайте DID_API_USERNAME и DID_API_PASSWORD."
+            )
+        user_pass = f"{user}:{pwd}"
+    # простая валидация
+    if ":" not in user_pass or not user_pass.split(":", 1)[0] or not user_pass.split(":", 1)[1]:
+        raise RuntimeError("Некорректная пара USER:PASS для D-ID (проверьте переменные окружения).")
+    return user_pass
 
-def _auth_headers(raw_key: str, mode: str) -> dict:
+def _auth_headers_basic(user_pass: str) -> dict:
+    """
+    D-ID доки показывают формат Authorization: Basic API_USERNAME:API_PASSWORD (без base64).
+    Поэтому кладём пару как есть. (Если ваш аккаунт ожидает base64 — раскомментируйте блок ниже.)
+    """
     h = _headers_common()
-    if mode == "basic":
-        # большинство аккаунтов D-ID принимают ключ как Basic <api_key> ИЛИ Basic <base64(user:pass)>
-        h["Authorization"] = f"Basic {raw_key}"
-    elif mode == "xapikey":
-        h["x-api-key"] = raw_key  # регистр в HTTP несущественен, но используем нижний
-    else:  # bearer
-        h["Authorization"] = f"Bearer {raw_key}"
+    h["Authorization"] = f"Basic {user_pass}"
+
+    # --- вариант на случай редких аккаунтов, где нужен классический Basic с base64:
+    # u, p = user_pass.split(":", 1)
+    # token = base64.b64encode(f"{u}:{p}".encode("utf-8")).decode("ascii")
+    # h["Authorization"] = f"Basic {token}"
     return h
 
-def _request_json(method: str, url: str, json_body, raw_key: str):
+def _request_json(method: str, url: str, json_body, user_pass: str):
     """
-    Делаем запрос с перебором режимов авторизации.
-    Порядок:
-      1) фиксированный из DID_AUTH_MODE, если задан
-      2) иначе: basic -> xapikey -> bearer
-    На 401/403 пытаемся следующий режим, но если сервер вернул осмысленное тело — поднимаем
-    понятное исключение с текстом ошибки.
+    Один способ — Basic USER:PASS. Если вернулся 401/403, поднимем понятную ошибку.
     """
-    fixed = _sanitize(os.getenv("DID_AUTH_MODE", "")).lower()
-    modes = [fixed] if fixed in ("basic", "xapikey", "bearer") else ["basic", "xapikey", "bearer"]
-
-    last_text = None
-    last_status = None
-    for m in modes:
-        try:
-            with httpx.Client(timeout=30.0, follow_redirects=True) as c:
-                r = c.request(method, url, headers=_auth_headers(raw_key, m), json=json_body)
-                last_status = r.status_code
-                ct = (r.headers.get("Content-Type") or "").lower()
-                last_text = r.text
-
-                if r.status_code in (401, 403):
-                    # Если сервер прислал понятное JSON-объяснение — пробросим его сразу.
-                    try:
-                        data = r.json()
-                        msg = (data.get("message") or data.get("error") or str(data)).strip()
-                        # Если это не похоже на авторизацию, выкинем сразу, не переключаясь
-                        if "key" in msg.lower() or "auth" in msg.lower() or "forbidden" in msg.lower():
-                            # это авторизация — попробуем следующий режим
-                            pass
-                        else:
-                            raise RuntimeError(f"D-ID error: {msg}")
-                    except Exception:
-                        # не json — просто попробуем следующий режим
-                        pass
-                    continue
-
-                r.raise_for_status()
-                if ct.startswith("application/json"):
-                    return r.json()
-                return {"raw": r.text}
-        except Exception as e:
-            # пробуем следующий режим
-            last_text = f"{type(e).__name__}: {e}"
-            continue
-
-    # все режимы не сработали — покажем последнюю ошибку подробнее
-    raise RuntimeError(f"Authorization to D-ID failed (last_status={last_status}): {last_text}")
+    headers = _auth_headers_basic(user_pass)
+    with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+        r = c.request(method, url, headers=headers, json=json_body)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if r.status_code in (401, 403):
+            # максимально полный текст от сервера
+            try:
+                data = r.json()
+                msg = (data.get("message") or data.get("error") or str(data)).strip()
+            except Exception:
+                msg = r.text
+            raise RuntimeError(f"Авторизация в D-ID не прошла: {msg} (HTTP {r.status_code})")
+        r.raise_for_status()
+        if ct.startswith("application/json"):
+            return r.json()
+        return {"raw": r.text}
 
 # ====== API ======
-def create_talk(raw_key: str, source_url: str, text: str, voice: str = DEFAULT_VOICE, stitch: bool = True) -> str:
+def create_talk(user_pass: str, source_url: str, text: str, voice: str = DEFAULT_VOICE, stitch: bool = True) -> str:
     payload = {
         "source_url": source_url,
         "script": {
@@ -123,19 +113,19 @@ def create_talk(raw_key: str, source_url: str, text: str, voice: str = DEFAULT_V
         },
         "stitch": stitch
     }
-    data = _request_json("POST", f"{API_BASE}/talks", payload, raw_key)
+    data = _request_json("POST", f"{API_BASE}/talks", payload, user_pass)
     if "id" not in data:
-        raise RuntimeError(f"Unexpected D-ID response: {data}")
+        raise RuntimeError(f"Неожиданный ответ D-ID: {data}")
     return data["id"]
 
-def get_talk(raw_key: str, talk_id: str) -> dict:
-    return _request_json("GET", f"{API_BASE}/talks/{talk_id}", None, raw_key)
+def get_talk(user_pass: str, talk_id: str) -> dict:
+    return _request_json("GET", f"{API_BASE}/talks/{talk_id}", None, user_pass)
 
-def wait_until_ready(raw_key: str, talk_id: str, timeout: float = 180.0, interval: float = 2.0) -> Tuple[str, dict]:
+def wait_until_ready(user_pass: str, talk_id: str, timeout: float = 180.0, interval: float = 2.0) -> Tuple[str, dict]:
     start = time.time()
     last = {}
     while True:
-        info = get_talk(raw_key, talk_id)
+        info = get_talk(user_pass, talk_id)
         last = info
         status = (info.get("status") or "").lower()
         if status == "done":
@@ -148,9 +138,9 @@ def wait_until_ready(raw_key: str, talk_id: str, timeout: float = 180.0, interva
             hint = ""
             if "source_url" in err.lower():
                 hint = (
-                    "\nПодсказка: Ваш тариф D-ID может не принимать source_url=data:... "
+                    "\nПодсказка: ваш тариф D-ID может не принимать source_url как data: URL. "
                     "Загрузите avatar.png на публичный HTTPS и установите "
-                    "DID_SOURCE_URL=https://.../avatar.png в переменных окружения."
+                    "DID_SOURCE_URL=https://.../avatar.png."
                 )
             raise RuntimeError(f"D-ID error: {err}{hint}")
         if time.time() - start > timeout:
@@ -181,26 +171,32 @@ def make_talk_video(text: str,
                     image: str = "avatar.png",
                     out: Optional[str] = None,
                     voice: Optional[str] = None,
-                    stitch: bool = True,
-                    raw_key: Optional[str] = None) -> str:
+                    stitch: bool = True) -> str:
+    """
+    Синхронно делает ролик с озвучкой текста и возвращает путь к mp4.
+    Используется из Telegram-бота (импортом модуля).
+    """
     if not text or not text.strip():
         raise ValueError("Пустой текст для озвучки")
 
-    raw_key = raw_key or get_key_from_env_or_fail()
+    user_pass = get_basic_pair_or_fail()
 
     # Если задан DID_SOURCE_URL — используем его. Иначе data: из файла.
     env_src = _sanitize(os.getenv("DID_SOURCE_URL", ""))
-    source_url = env_src if env_src else file_to_data_url(image)
+    if env_src:
+        source_url = env_src
+    else:
+        source_url = file_to_data_url(image)
 
     voice_id = (voice or DEFAULT_VOICE)
 
-    talk_id = create_talk(raw_key, source_url, text.strip(), voice=voice_id, stitch=stitch)
+    talk_id = create_talk(user_pass, source_url, text.strip(), voice=voice_id, stitch=stitch)
 
     safe_head = "".join(ch for ch in text[:40] if ch.isalnum() or ch in (" ", "_", "-")).strip().replace(" ", "_")
     out_file = out or (safe_head or "talk") + ".mp4"
     out_path = _abs(out_file)
 
-    result_url, _info = wait_until_ready(raw_key, talk_id, timeout=180.0, interval=2.0)
+    result_url, _info = wait_until_ready(user_pass, talk_id, timeout=180.0, interval=2.0)
     saved = download_file(result_url, out_path)
     return saved
 
