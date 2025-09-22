@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-talk_maker.py — минималистичный генератор видео-речи через D-ID API.
-Поддерживает:
- - CLI режим: python talk_maker.py -t "Привет! Я цифровой аватар Тимура."
- - Импорт из кода: make_talk_video(text, image="avatar.png", out="out.mp4")
+talk_maker.py — генератор видео-речи через D-ID API.
+
+Запуск:
+  CLI:  python talk_maker.py -t "Привет!"
+  Код:  make_talk_video("Привет!", image="avatar.png", out="talk.mp4")
 
 Ожидает:
- - переменная окружения DID_API_KEY (или DID_API_USERNAME/DID_API_PASSWORD для basic)
- - локальный файл avatar.png в корне (или HTTPS-ссылка в DID_SOURCE_URL / явный source_url)
+  DID_API_KEY  (или DID_API_USERNAME/DID_API_PASSWORD для basic)
+  avatar.png в корне ИЛИ DID_SOURCE_URL=https://.../avatar.png
 
-Если тариф D-ID не принимает source_url=data:..., положите картинку на HTTPS
-и укажите переменную окружения DID_SOURCE_URL=https://.../avatar.png
+ENV (опционально):
+  DID_AUTH_MODE=basic|xapikey|bearer   # зафиксировать режим авторизации
 """
 
 import os
 import time
 import argparse
 import pathlib
+import base64
 from typing import Optional, Tuple
 
 import httpx
@@ -25,85 +27,93 @@ import httpx
 API_BASE = "https://api.d-id.com/v1"
 DEFAULT_VOICE = "ru-RU-DmitryNeural"
 
-# ====== Вспомогательные ======
-def _sanitize_line(x: str) -> str:
+# ====== Утилиты ======
+def _sanitize(x: str) -> str:
     return (x or "").strip().replace("\r", "").replace("\n", "")
 
 def _abs(p: str) -> str:
     return str(pathlib.Path(p).absolute())
 
+def _headers_common() -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
 # ====== Авторизация ======
 def get_key_from_env_or_fail() -> str:
-    """
-    Возвращает сырой ключ/токен для D-ID:
-    - DID_API_KEY (рекомендуется)
-    - или пара DID_API_USERNAME + DID_API_PASSWORD (будет использован как Basic)
-    """
-    k = _sanitize_line(os.getenv("DID_API_KEY", ""))
+    k = _sanitize(os.getenv("DID_API_KEY", ""))
     if k:
         return k
-    user = _sanitize_line(os.getenv("DID_API_USERNAME", ""))
-    pwd  = _sanitize_line(os.getenv("DID_API_PASSWORD", ""))
+    user = _sanitize(os.getenv("DID_API_USERNAME", ""))
+    pwd  = _sanitize(os.getenv("DID_API_PASSWORD", ""))
     if user and pwd:
-        import base64
-        # вернём уже base64, чтобы _auth_headers мог подставить как Basic <base64>
         return base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("utf-8")
-    raise RuntimeError("DID_API_KEY не задан в окружении (или укажите DID_API_USERNAME/DID_API_PASSWORD)")
+    raise RuntimeError("DID_API_KEY не задан (или укажите DID_API_USERNAME/DID_API_PASSWORD)")
 
-def _auth_headers(raw_key: str, mode: str = "bearer") -> dict:
-    """
-    Возвращает заголовки авторизации для D-ID.
-    Поддерживаемые режимы: bearer | basic | xapikey
-    """
-    h = {"Content-Type": "application/json"}
-    k = (raw_key or "").strip()
-    if not k:
-        return h
-    if mode == "bearer":
-        # Authorization: Bearer <token>
-        h["Authorization"] = f"Bearer {k}"
-    elif mode == "basic":
-        # Authorization: Basic <base64(user:pass)> или Basic <api-key> (на некоторых аккаунтах)
-        h["Authorization"] = f"Basic {k}"
-    else:
-        # X-API-KEY: <token>
-        h["X-API-KEY"] = k
+def _auth_headers(raw_key: str, mode: str) -> dict:
+    h = _headers_common()
+    if mode == "basic":
+        # большинство аккаунтов D-ID принимают ключ как Basic <api_key> ИЛИ Basic <base64(user:pass)>
+        h["Authorization"] = f"Basic {raw_key}"
+    elif mode == "xapikey":
+        h["x-api-key"] = raw_key  # регистр в HTTP несущественен, но используем нижний
+    else:  # bearer
+        h["Authorization"] = f"Bearer {raw_key}"
     return h
 
 def _request_json(method: str, url: str, json_body, raw_key: str):
     """
-    Делает запрос к D-ID, пробуя несколько вариантов авторизации:
-    1) Bearer
-    2) Basic
-    3) X-API-KEY
-    Если 401/403 — пробуем следующий способ. Иначе — поднимаем исключение при ошибке.
+    Делаем запрос с перебором режимов авторизации.
+    Порядок:
+      1) фиксированный из DID_AUTH_MODE, если задан
+      2) иначе: basic -> xapikey -> bearer
+    На 401/403 пытаемся следующий режим, но если сервер вернул осмысленное тело — поднимаем
+    понятное исключение с текстом ошибки.
     """
-    modes = ["bearer", "basic", "xapikey"]
-    last_exc = None
+    fixed = _sanitize(os.getenv("DID_AUTH_MODE", "")).lower()
+    modes = [fixed] if fixed in ("basic", "xapikey", "bearer") else ["basic", "xapikey", "bearer"]
+
+    last_text = None
+    last_status = None
     for m in modes:
         try:
             with httpx.Client(timeout=30.0, follow_redirects=True) as c:
                 r = c.request(method, url, headers=_auth_headers(raw_key, m), json=json_body)
+                last_status = r.status_code
+                ct = (r.headers.get("Content-Type") or "").lower()
+                last_text = r.text
+
                 if r.status_code in (401, 403):
-                    # пробуем другой тип авторизации
+                    # Если сервер прислал понятное JSON-объяснение — пробросим его сразу.
+                    try:
+                        data = r.json()
+                        msg = (data.get("message") or data.get("error") or str(data)).strip()
+                        # Если это не похоже на авторизацию, выкинем сразу, не переключаясь
+                        if "key" in msg.lower() or "auth" in msg.lower() or "forbidden" in msg.lower():
+                            # это авторизация — попробуем следующий режим
+                            pass
+                        else:
+                            raise RuntimeError(f"D-ID error: {msg}")
+                    except Exception:
+                        # не json — просто попробуем следующий режим
+                        pass
                     continue
+
                 r.raise_for_status()
-                if r.content and r.headers.get("Content-Type", "").lower().startswith("application/json"):
+                if ct.startswith("application/json"):
                     return r.json()
-                # не JSON — вернём как текст
                 return {"raw": r.text}
         except Exception as e:
-            last_exc = e
-    # все способы не сработали
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("Authorization to D-ID failed")
+            # пробуем следующий режим
+            last_text = f"{type(e).__name__}: {e}"
+            continue
 
-# ====== API вызовы ======
+    # все режимы не сработали — покажем последнюю ошибку подробнее
+    raise RuntimeError(f"Authorization to D-ID failed (last_status={last_status}): {last_text}")
+
+# ====== API ======
 def create_talk(raw_key: str, source_url: str, text: str, voice: str = DEFAULT_VOICE, stitch: bool = True) -> str:
-    """
-    Создаёт talk и возвращает его id.
-    """
     payload = {
         "source_url": source_url,
         "script": {
@@ -122,9 +132,6 @@ def get_talk(raw_key: str, talk_id: str) -> dict:
     return _request_json("GET", f"{API_BASE}/talks/{talk_id}", None, raw_key)
 
 def wait_until_ready(raw_key: str, talk_id: str, timeout: float = 180.0, interval: float = 2.0) -> Tuple[str, dict]:
-    """
-    Дождаться готовности, вернуть (result_url, full_json).
-    """
     start = time.time()
     last = {}
     while True:
@@ -137,14 +144,13 @@ def wait_until_ready(raw_key: str, talk_id: str, timeout: float = 180.0, interva
                 raise RuntimeError("result_url отсутствует в ответе D-ID")
             return result_url, info
         if status in ("error", "failed"):
-            # Частый кейс: некоторые тарифы запрещают source_url=data:...
             err = (info.get("error") or info.get("message") or str(info) or "").strip()
             hint = ""
             if "source_url" in err.lower():
                 hint = (
-                    "\nПодсказка: Ваш тариф D-ID может не принимать source_url как data: URL. "
-                    "Загрузите avatar.png на доступный по HTTPS хост (S3/статик Render) и "
-                    "установите переменную окружения DID_SOURCE_URL=https://.../avatar.png."
+                    "\nПодсказка: Ваш тариф D-ID может не принимать source_url=data:... "
+                    "Загрузите avatar.png на публичный HTTPS и установите "
+                    "DID_SOURCE_URL=https://.../avatar.png в переменных окружения."
                 )
             raise RuntimeError(f"D-ID error: {err}{hint}")
         if time.time() - start > timeout:
@@ -161,12 +167,8 @@ def download_file(url: str, out_path: str) -> str:
                     f.write(chunk)
     return out
 
-# ====== Источники (аватар) ======
+# ====== Источник (аватар) ======
 def file_to_data_url(path: str) -> str:
-    """
-    Простой data: URL для картинки. Если тариф не поддерживает — используйте DID_SOURCE_URL.
-    """
-    import base64
     abspath = _abs(path)
     if not os.path.exists(abspath):
         raise FileNotFoundError(f"Avatar not found: {abspath}")
@@ -174,34 +176,26 @@ def file_to_data_url(path: str) -> str:
         b64 = base64.b64encode(f.read()).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
-# ====== Публичная функция для использования из бота ======
+# ====== Публичная функция ======
 def make_talk_video(text: str,
                     image: str = "avatar.png",
                     out: Optional[str] = None,
                     voice: Optional[str] = None,
                     stitch: bool = True,
                     raw_key: Optional[str] = None) -> str:
-    """
-    Синхронно делает ролик с озвучкой текста и возвращает путь к mp4.
-    Используется из Telegram-бота (импортом модуля).
-    """
     if not text or not text.strip():
         raise ValueError("Пустой текст для озвучки")
 
     raw_key = raw_key or get_key_from_env_or_fail()
 
-    # Если задан DID_SOURCE_URL — используем его. Иначе попробуем data: из локального файла.
-    env_src = _sanitize_line(os.getenv("DID_SOURCE_URL", ""))
-    if env_src:
-        source_url = env_src
-    else:
-        source_url = file_to_data_url(image)
+    # Если задан DID_SOURCE_URL — используем его. Иначе data: из файла.
+    env_src = _sanitize(os.getenv("DID_SOURCE_URL", ""))
+    source_url = env_src if env_src else file_to_data_url(image)
 
     voice_id = (voice or DEFAULT_VOICE)
 
     talk_id = create_talk(raw_key, source_url, text.strip(), voice=voice_id, stitch=stitch)
 
-    # имя файла по умолчанию — из первых символов текста
     safe_head = "".join(ch for ch in text[:40] if ch.isalnum() or ch in (" ", "_", "-")).strip().replace(" ", "_")
     out_file = out or (safe_head or "talk") + ".mp4"
     out_path = _abs(out_file)
